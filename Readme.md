@@ -2810,4 +2810,1491 @@ class ParallelSum extends RecursiveTask<Long> {
 - Workers report results
 
 **Problems using this pattern**:
-1. ✓ **Threa
+1. ✓ **Thread Pool with Dynamic Sizing**
+2. Distributed computation coordinator
+3. Load balancer
+4. Job scheduler
+
+**Data structures**:
+```java
+BlockingQueue<Task> (work queue)
+ExecutorService (worker pool)
+CompletionService (for results)
+```
+
+**Template code**:
+```java
+class MasterWorker {
+    private final ExecutorService workers;
+    private final BlockingQueue<Task> workQueue;
+    private final CompletionService<Result> completionService;
+    
+    public MasterWorker(int numWorkers) {
+        this.workers = Executors.newFixedThreadPool(numWorkers);
+        this.workQueue = new LinkedBlockingQueue<>();
+        this.completionService = new ExecutorCompletionService<>(workers);
+    }
+    
+    // Master: distribute work
+    void submitTasks(List<Task> tasks) {
+        for (Task task : tasks) {
+            completionService.submit(() -> processTask(task));
+        }
+    }
+    
+    // Master: collect results
+    List<Result> collectResults(int numTasks) throws Exception {
+        List<Result> results = new ArrayList<>();
+        for (int i = 0; i < numTasks; i++) {
+            results.add(completionService.take().get());
+        }
+        return results;
+    }
+}
+```
+
+---
+
+## Pattern 11: Copy-on-Write / Immutable State
+
+**Description**: Create new version on modification, readers see consistent snapshot
+
+**Structure**:
+```
+Thread-1 (reader) → sees version 1
+Thread-2 (writer) → creates version 2
+Thread-3 (reader) → sees version 1 (still)
+Thread-4 (reader) → sees version 2 (after switch)
+```
+
+**Key characteristics**:
+- Immutable objects
+- Atomic reference swap
+- No locks for readers
+- Copy entire structure on write
+
+**Problems using this pattern**:
+1. Configuration updates
+2. Read-heavy lists/sets
+3. Event listeners
+4. Snapshot isolation
+
+**Data structures**:
+```java
+AtomicReference<ImmutableState>
+CopyOnWriteArrayList
+CopyOnWriteArraySet
+```
+
+**Template code**:
+```java
+class ImmutableConfig {
+    private final AtomicReference<Config> configRef;
+    
+    // Read (no lock!)
+    Config getConfig() {
+        return configRef.get();  // Atomic read
+    }
+    
+    // Write (creates new copy)
+    void updateConfig(Function<Config, Config> updater) {
+        configRef.updateAndGet(old -> {
+            // Create new immutable config
+            return updater.apply(old);
+        });
+    }
+}
+
+// CopyOnWriteArrayList example
+class EventBus {
+    private final CopyOnWriteArrayList<Listener> listeners = 
+        new CopyOnWriteArrayList<>();
+    
+    void register(Listener listener) {
+        listeners.add(listener);  // Creates new copy
+    }
+    
+    void fireEvent(Event event) {
+        // Iteration sees consistent snapshot, no ConcurrentModificationException
+        for (Listener listener : listeners) {
+            listener.onEvent(event);
+        }
+    }
+}
+```
+
+**When to use**:
+- ✓ Read-heavy (99%+ reads)
+- ✓ Small collections
+- ✗ Write-heavy (copying is expensive)
+- ✗ Large collections (memory overhead)
+
+---
+
+## Pattern 12: Coordination / Lock Management
+
+**Description**: Manage locks on multiple resources, prevent deadlock
+
+**Structure**:
+```
+Resources: [R1, R2, R3]
+Lock graph: Track who holds what, who waits for what
+Deadlock detection: Cycle detection in wait graph
+```
+
+**Key characteristics**:
+- Multiple resource locks
+- Deadlock prevention/detection
+- Lock ordering
+- Timeout-based acquisition
+
+**Problems using this pattern**:
+1. ✓ **Distributed Lock Manager**
+2. Database transaction manager
+3. Resource allocation
+4. Dining philosophers
+
+**Data structures**:
+```java
+ConcurrentHashMap<Resource, LockInfo>
+Graph structure for deadlock detection
+```
+
+---
+
+## Pattern Mapping to Problems
+
+| Problem | Primary Pattern | Secondary Pattern |
+|---------|----------------|-------------------|
+| **Batch Processor with Auto-Flush** | Producer-Consumer | Rate Limiting (time-based) |
+| **Connection Pool Manager** | Resource Pool | - |
+| **TTL Cache with Size Limits** | Cache/Map | - |
+| **Priority Task Scheduler** | Producer-Consumer | - |
+| **Rate Limiter** | Rate Limiting | - |
+| **Multi-Stage Pipeline** | Producer-Consumer | Pipeline (multiple queues) |
+| **Write-Behind Cache** | Cache/Map | Producer-Consumer (write queue) |
+| **Distributed Lock Manager** | Coordination | - |
+| **Real-Time Metrics Aggregator** | Metrics/Statistics | - |
+| **Producer-Consumer Multi-Queue** | Producer-Consumer | Master-Worker (routing) |
+| **Concurrent Data Deduplicator** | Deduplication | - |
+| **Multi-Level Cache** | Cache/Map | Read-Write Split |
+| **Thread Pool Dynamic Sizing** | Master-Worker | Resource Pool |
+| **Concurrent Result Aggregator** | Fork-Join | Barrier (if waiting for all) |
+| **Reader-Writer Config** | Read-Write Split | Copy-on-Write |
+| **Barrier for Parallel Processing** | Barrier/Phaser | - |
+
+---
+
+## Pattern Selection Flowchart
+
+```
+What are you building?
+
+├─ Work flows through system?
+│  └─ Producer-Consumer Queue
+│
+├─ Reusable resources (borrow/return)?
+│  └─ Resource Pool
+│
+├─ Key-value storage?
+│  └─ Cache/Map
+│
+├─ Controlling rate of operations?
+│  └─ Rate Limiting
+│
+├─ Collecting statistics?
+│  └─ Metrics/Statistics
+│
+├─ Tracking unique items?
+│  └─ Deduplication
+│
+├─ Many readers, few writers?
+│  └─ Read-Write Split or Copy-on-Write
+│
+├─ Wait for multiple threads?
+│  └─ Barrier/Phaser
+│
+├─ Divide work recursively?
+│  └─ Fork-Join
+│
+├─ Central coordinator + workers?
+│  └─ Master-Worker
+│
+└─ Managing multiple locks?
+   └─ Coordination/Lock Management
+```
+
+---
+
+## Which Patterns Need Lock-Free?
+
+| Pattern | Lock-Free Helps? | Why |
+|---------|------------------|-----|
+| Producer-Consumer | Medium | Queue operations benefit, but need blocking when empty |
+| Resource Pool | Medium | Fast path yes, but need blocking when exhausted |
+| Cache/Map | Yes | `ConcurrentHashMap` is perfect |
+| Rate Limiting | Yes | `AtomicInteger` for token counter |
+| Metrics/Statistics | Yes | `LongAdder` for high-contention counters |
+| Deduplication | Yes | `ConcurrentHashMap.newKeySet()` |
+| Read-Write Split | No | `ReadWriteLock` is the point |
+| Barrier/Phaser | No | Need coordination, locks appropriate |
+| Fork-Join | Yes | `ForkJoinPool` uses work-stealing (lock-free) |
+| Master-Worker | Medium | Work queue can be lock-free |
+| Copy-on-Write | Yes | `AtomicReference` + immutable state |
+| Coordination | No | Managing locks, locks appropriate |
+
+---
+
+# Lock-Free Data Structures Reference
+
+## Java Built-In Lock-Free Data Structures
+
+### Atomic Variables (java.util.concurrent.atomic)
+
+```java
+// Single values
+AtomicBoolean     // boolean
+AtomicInteger     // int
+AtomicLong        // long
+AtomicReference<T> // any object reference
+
+// Arrays
+AtomicIntegerArray
+AtomicLongArray
+AtomicReferenceArray<T>
+
+// Field updaters (advanced)
+AtomicIntegerFieldUpdater
+AtomicLongFieldUpdater
+AtomicReferenceFieldUpdater
+
+// Special purpose
+LongAdder         // Better than AtomicLong for high contention
+LongAccumulator   // Customizable accumulation
+DoubleAdder       // For doubles
+DoubleAccumulator
+```
+
+### AtomicInteger / AtomicLong
+
+**Use for:** Counters, IDs, statistics
+
+```java
+AtomicInteger counter = new AtomicInteger(0);
+
+// Read
+int value = counter.get();
+
+// Write
+counter.set(10);
+
+// Increment/Decrement
+int newValue = counter.incrementAndGet();  // ++i
+int oldValue = counter.getAndIncrement();  // i++
+counter.decrementAndGet();                 // --i
+counter.getAndDecrement();                 // i--
+
+// Add
+counter.addAndGet(5);    // i += 5, return new value
+counter.getAndAdd(5);    // i += 5, return old value
+
+// CAS
+boolean success = counter.compareAndSet(5, 10);  // if (i == 5) i = 10
+
+// Update with function
+counter.updateAndGet(x -> x * 2);  // i = i * 2
+counter.accumulateAndGet(5, (x, y) -> x + y);  // i = i + 5
+```
+
+**When to use:**
+- ✓ Simple counters (pages crawled, requests processed)
+- ✓ Sequence generators (ID generation)
+- ✓ Statistics (success/failure counts)
+- ✓ Flags with numeric meaning
+
+---
+
+### AtomicBoolean
+
+**Use for:** Flags, states, one-time initialization
+
+```java
+AtomicBoolean flag = new AtomicBoolean(false);
+
+// Read/Write
+boolean value = flag.get();
+flag.set(true);
+
+// CAS (most useful)
+boolean wasSet = flag.compareAndSet(false, true);
+
+// Get and set
+boolean old = flag.getAndSet(true);
+```
+
+**When to use:**
+- ✓ Shutdown flags
+- ✓ One-time initialization
+- ✓ Simple state toggles
+- ✓ Circuit breaker states
+
+---
+
+### AtomicReference<T>
+
+**Use for:** Object references, complex state
+
+```java
+AtomicReference<String> ref = new AtomicReference<>("initial");
+
+// Read/Write
+String value = ref.get();
+ref.set("new value");
+
+// CAS
+boolean success = ref.compareAndSet("old", "new");
+
+// Update with function
+ref.updateAndGet(old -> old + " modified");
+
+// Get and update
+String old = ref.getAndUpdate(x -> x + " suffix");
+```
+
+**When to use:**
+- ✓ Configuration objects (swap entire config atomically)
+- ✓ Immutable state updates
+- ✓ Head/tail pointers in lock-free data structures
+- ✓ Cached computed values
+
+**Important caveat - ABA problem:**
+```java
+// Problem scenario
+AtomicReference<Node> head = new AtomicReference<>(nodeA);
+
+// Thread 1: Read head (gets A)
+Node old = head.get();  // A
+
+// Thread 2: Remove A, remove B, add A back
+head.set(nodeB);
+head.set(nodeA);  // Same object!
+
+// Thread 1: CAS succeeds but A might be in inconsistent state
+head.compareAndSet(old, newNode);  // Succeeds! (But dangerous)
+
+// Solution: Use AtomicStampedReference
+AtomicStampedReference<Node> head = new AtomicStampedReference<>(nodeA, 0);
+
+int[] stampHolder = new int[1];
+Node old = head.get(stampHolder);
+int oldStamp = stampHolder[0];
+
+// CAS with stamp - fails if stamp changed
+head.compareAndSet(old, newNode, oldStamp, oldStamp + 1);
+```
+
+---
+
+### LongAdder / DoubleAdder
+
+**Use for:** High-contention counters
+
+```java
+// Replace this (under HIGH contention):
+AtomicLong counter = new AtomicLong();
+counter.incrementAndGet();  // Many CAS retries under contention
+
+// With this:
+LongAdder counter = new LongAdder();
+counter.increment();  // Distributes contention across cells
+
+// Read (slightly more expensive)
+long total = counter.sum();
+```
+
+**How it works:**
+```
+AtomicLong (single variable):
+Thread-1: [CAS on same variable]
+Thread-2: [CAS on same variable] → retry
+Thread-3: [CAS on same variable] → retry
+Thread-4: [CAS on same variable] → retry
+
+LongAdder (multiple cells):
+Thread-1: [CAS on cell-0] ✓
+Thread-2: [CAS on cell-1] ✓ (different cell!)
+Thread-3: [CAS on cell-2] ✓
+Thread-4: [CAS on cell-3] ✓
+
+When reading: sum all cells
+```
+
+**When to use:**
+- ✓ Very high contention (16+ threads)
+- ✓ Write-heavy workloads (many increments)
+- ✓ Don't need exact value frequently
+- ✗ Don't use if you need to read often (sum is expensive)
+
+---
+
+### ConcurrentHashMap<K, V>
+
+**Use for:** Thread-safe key-value storage
+
+```java
+ConcurrentHashMap<String, Integer> map = new ConcurrentHashMap<>();
+
+// Basic operations (lock-free for different keys)
+map.put("key", 1);
+Integer value = map.get("key");
+map.remove("key");
+
+// Atomic operations (very useful!)
+map.putIfAbsent("key", 1);  // Only if not present
+
+map.computeIfAbsent("key", k -> expensiveComputation(k));  // Lazy init
+
+map.computeIfPresent("key", (k, v) -> v + 1);  // Update if exists
+
+map.compute("key", (k, v) -> v == null ? 1 : v + 1);  // Upsert
+
+map.merge("key", 1, Integer::sum);  // Increment or set to 1
+
+// Replace operations
+map.replace("key", 1, 2);  // CAS: if value is 1, set to 2
+
+// Bulk operations (parallel internally)
+map.forEach((k, v) -> process(k, v));
+map.search(Long.MAX_VALUE, (k, v) -> v > 100 ? k : null);
+Integer sum = map.reduceValues(Long.MAX_VALUE, Integer::sum);
+```
+
+**When to use:**
+- ✓ Shared caches
+- ✓ Visited sets (deduplication)
+- ✓ Frequency maps
+- ✓ Any concurrent map needs
+
+**Special feature - KeySet as Set:**
+```java
+// Lock-free concurrent set!
+Set<String> set = ConcurrentHashMap.newKeySet();
+
+set.add("item");  // Lock-free!
+boolean isNew = set.add("item");  // Returns false if duplicate
+
+// Perfect for:
+Set<String> visitedUrls = ConcurrentHashMap.newKeySet();
+if (visitedUrls.add(url)) {
+    // New URL, crawl it
+}
+```
+
+---
+
+### ConcurrentLinkedQueue<E>
+
+**Use for:** Unbounded lock-free queue
+
+```java
+ConcurrentLinkedQueue<String> queue = new ConcurrentLinkedQueue<>();
+
+// Add (always succeeds, unbounded)
+queue.offer("item");  // Lock-free CAS
+queue.add("item");    // Same as offer
+
+// Remove
+String item = queue.poll();  // null if empty, lock-free CAS
+
+// Peek
+String head = queue.peek();  // Don't remove
+
+// Check
+boolean empty = queue.isEmpty();
+int size = queue.size();  // O(n)! Not constant time
+```
+
+**When to use:**
+- ✓ Task queues (unbounded)
+- ✓ Event queues
+- ✓ Connection pools (available connections)
+- ✓ High-throughput producer-consumer
+
+**When NOT to use:**
+- ✗ Need blocking when empty (use `BlockingQueue`)
+- ✗ Need bounded size (use `ArrayBlockingQueue`)
+- ✗ Need frequent size checks (size is O(n))
+
+---
+
+### ConcurrentLinkedDeque<E>
+
+**Use for:** Lock-free double-ended queue
+
+```java
+ConcurrentLinkedDeque<String> deque = new ConcurrentLinkedDeque<>();
+
+// Add to front
+deque.offerFirst("first");
+deque.addFirst("first");
+
+// Add to back
+deque.offerLast("last");
+deque.addLast("last");
+
+// Remove from front
+String first = deque.pollFirst();
+
+// Remove from back
+String last = deque.pollLast();
+```
+
+**When to use:**
+- ✓ Work-stealing queues
+- ✓ LRU cache (add to front, remove from back)
+- ✓ Undo/redo stacks
+
+---
+
+### ConcurrentSkipListMap<K, V> / ConcurrentSkipListSet<E>
+
+**Use for:** Sorted concurrent map/set
+
+```java
+// Replace TreeMap + lock with:
+ConcurrentSkipListMap<Integer, String> map = new ConcurrentSkipListMap<>();
+
+map.put(1, "one");
+map.put(3, "three");
+map.put(2, "two");
+
+// Sorted operations
+String first = map.firstEntry().getValue();  // "one"
+String last = map.lastEntry().getValue();    // "three"
+
+// Range queries
+SortedMap<Integer, String> subMap = map.subMap(1, 3);
+
+// For set:
+ConcurrentSkipListSet<Integer> set = new ConcurrentSkipListSet<>();
+set.add(3);
+set.add(1);
+set.add(2);
+Integer first = set.first();  // 1 (sorted!)
+```
+
+**When to use:**
+- ✓ Need sorted data structure
+- ✓ Priority queues (but see `PriorityBlockingQueue`)
+- ✓ Range queries
+- ✓ Task scheduler (sorted by time)
+
+---
+
+### Blocking Collections (Hybrid: Lock-Free + Locks)
+
+```java
+// ArrayBlockingQueue - bounded, array-based
+BlockingQueue<String> queue = new ArrayBlockingQueue<>(100);
+queue.put("item");  // Blocks if full
+String item = queue.take();  // Blocks if empty
+
+// LinkedBlockingQueue - optionally bounded, linked nodes
+BlockingQueue<String> queue = new LinkedBlockingQueue<>(100);
+
+// PriorityBlockingQueue - unbounded, sorted
+BlockingQueue<Task> queue = new PriorityBlockingQueue<>();
+
+// SynchronousQueue - no storage, direct handoff
+BlockingQueue<String> queue = new SynchronousQueue<>();
+queue.put("item");  // Blocks until another thread takes it
+
+// DelayQueue - elements available after delay
+DelayQueue<DelayedTask> queue = new DelayQueue<>();
+
+// LinkedTransferQueue - performance optimized
+TransferQueue<String> queue = new LinkedTransferQueue<>();
+```
+
+---
+
+## Complete Replacement Guide
+
+### Counters and Flags
+
+```java
+// Simple counter
+int count;                    → AtomicInteger
+long count;                   → AtomicLong
+
+// High-contention counter
+AtomicLong counter;           → LongAdder
+
+// Boolean flag
+boolean flag;                 → AtomicBoolean
+
+// Floating point counter
+double sum;                   → DoubleAdder
+```
+
+### Collections
+
+```java
+// Map
+HashMap + Lock                → ConcurrentHashMap
+TreeMap + Lock                → ConcurrentSkipListMap
+
+// Set
+HashSet + Lock                → ConcurrentHashMap.newKeySet()
+TreeSet + Lock                → ConcurrentSkipListSet
+
+// Queue
+LinkedList + Lock             → ConcurrentLinkedQueue
+ArrayDeque + Lock             → ConcurrentLinkedDeque
+
+// Priority Queue
+PriorityQueue + Lock          → PriorityBlockingQueue
+                              → ConcurrentSkipListSet (if don't need blocking)
+
+// Blocking Queue
+LinkedList + Lock + Condition → LinkedBlockingQueue
+Array + Lock + Condition      → ArrayBlockingQueue
+```
+
+### Object References
+
+```java
+// Simple reference
+T reference;                  → AtomicReference<T>
+
+// With version/stamp (ABA protection)
+T reference + int version;   → AtomicStampedReference<T>
+
+// With boolean mark
+T reference + boolean mark;   → AtomicMarkableReference<T>
+
+// Array of references
+T[] array;                    → AtomicReferenceArray<T>
+```
+
+---
+
+## Quick Decision Matrix
+
+| Need | Use This | Why |
+|------|----------|-----|
+| **Counter** | `AtomicInteger/Long` | Simple, fast |
+| **High-contention counter** | `LongAdder` | Distributes contention |
+| **Flag** | `AtomicBoolean` | Simple state |
+| **Object reference** | `AtomicReference<T>` | Immutable updates |
+| **Map** | `ConcurrentHashMap` | Most common, great performance |
+| **Set** | `ConcurrentHashMap.newKeySet()` | Built on ConcurrentHashMap |
+| **Queue** | `ConcurrentLinkedQueue` | Unbounded, lock-free |
+| **Deque** | `ConcurrentLinkedDeque` | Double-ended |
+| **Sorted map** | `ConcurrentSkipListMap` | Sorted access |
+| **Sorted set** | `ConcurrentSkipListSet` | Sorted access |
+| **Blocking queue** | `LinkedBlockingQueue` | Need blocking |
+| **Bounded queue** | `ArrayBlockingQueue` | Fixed capacity |
+| **Priority queue** | `PriorityBlockingQueue` | Sorted + blocking |
+
+---
+
+## Common Patterns in Interviews
+
+### Pattern 1: Visited Set
+```java
+Set<String> visited = ConcurrentHashMap.newKeySet();
+if (visited.add(url)) {
+    // New URL, process it
+}
+```
+
+### Pattern 2: Counter
+```java
+AtomicInteger counter = new AtomicInteger(0);
+counter.incrementAndGet();
+```
+
+### Pattern 3: Cache
+```java
+ConcurrentHashMap<K, V> cache = new ConcurrentHashMap<>();
+cache.computeIfAbsent(key, k -> expensiveCompute(k));
+```
+
+### Pattern 4: Task Queue
+```java
+ConcurrentLinkedQueue<Task> tasks = new ConcurrentLinkedQueue<>();
+tasks.offer(task);  // Add
+Task t = tasks.poll();  // Remove
+```
+
+### Pattern 5: Configuration
+```java
+AtomicReference<Config> config = new AtomicReference<>(initialConfig);
+config.updateAndGet(old -> new Config(old, newSettings));
+```
+
+### Pattern 6: Rate Limiter
+```java
+AtomicInteger tokens = new AtomicInteger(MAX_TOKENS);
+if (tokens.getAndDecrement() > 0) {
+    // Allow request
+} else {
+    tokens.incrementAndGet();  // Restore token
+    // Deny request
+}
+```
+
+---
+
+## Summary Cheat Sheet
+
+```java
+// MOST COMMON (memorize these)
+AtomicInteger               // Counters
+AtomicLong                  // Large counters
+AtomicBoolean               // Flags
+AtomicReference<T>          // Object references
+ConcurrentHashMap<K,V>      // Maps
+ConcurrentHashMap.newKeySet() // Sets
+ConcurrentLinkedQueue<E>    // Queues
+LongAdder                   // High-contention counters
+
+// LESS COMMON (know they exist)
+ConcurrentSkipListMap<K,V>  // Sorted map
+ConcurrentSkipListSet<E>    // Sorted set
+ConcurrentLinkedDeque<E>    // Double-ended queue
+LongAccumulator             // Custom accumulation
+
+// BLOCKING (hybrid, not pure lock-free)
+LinkedBlockingQueue<E>      // Bounded queue with blocking
+ArrayBlockingQueue<E>       // Array-based bounded queue
+PriorityBlockingQueue<E>    // Priority + blocking
+```
+
+---
+
+# Distributed Lock Manager - Interview Deep Dive
+
+## Problem Introduction
+
+**Interviewer**: "Design a distributed lock manager. Multiple threads need to acquire locks on different resources. Ensure no deadlocks and handle concurrent access safely."
+
+**Me**: "Great! Let me clarify the requirements:
+
+**Basic scenario**:
+```
+Thread-1 needs: [Database, FileSystem]
+Thread-2 needs: [Database, Network]
+Thread-3 needs: [FileSystem, Network]
+
+All trying to acquire at the same time - how do we prevent deadlock?
+```
+
+**Questions**:
+1. **Single vs Multiple Resources**: Can a thread acquire multiple locks at once?
+2. **Deadlock Handling**: Prevent or detect deadlocks?
+3. **Fairness**: Should locks be granted in FIFO order?
+4. **Timeout**: Should lock acquisition have a timeout?
+5. **Reentrancy**: Can the same thread acquire the same lock multiple times?
+6. **Distributed**: Is this actually distributed (across machines) or just multi-threaded?
+
+Let me assume:
+- Multiple locks per thread (the hard part!)
+- Prevent deadlocks (better than detecting)
+- Timeouts supported
+- Single machine (multi-threaded, not truly distributed)
+- Non-reentrant for simplicity
+
+Does this sound right?"
+
+**Interviewer**: "Yes, focus on preventing deadlocks with multiple locks per thread. Start with a basic design."
+
+---
+
+## Understanding the Deadlock Problem
+
+**Me**: "First, let me explain why this is hard. The classic deadlock scenario:
+
+```
+Time 0:
+Thread-1: Acquires Lock-A, wants Lock-B
+Thread-2: Acquires Lock-B, wants Lock-A
+
+Thread-1: Holds A, waiting for B ─┐
+                                   ├─→ DEADLOCK!
+Thread-2: Holds B, waiting for A ─┘
+
+Both threads wait forever!
+```
+
+**The four conditions for deadlock** (Coffman conditions):
+1. **Mutual Exclusion**: Only one thread can hold a lock
+2. **Hold and Wait**: Thread holds lock while waiting for another
+3. **No Preemption**: Can't force thread to release lock
+4. **Circular Wait**: Thread-1 → Lock-A → Thread-2 → Lock-B → Thread-1
+
+**Prevention strategies**:
+1. **Lock Ordering**: Always acquire locks in consistent order (break circular wait)
+2. **Timeout**: Give up after waiting too long (break hold and wait)
+3. **Try-Lock-All**: Acquire all or none (break hold and wait)
+4. **Deadlock Detection**: Find cycles and break them (detect circular wait)
+
+I'll implement multiple approaches."
+
+---
+
+## Approach 1: Lock Ordering (Simplest)
+
+**Me**: "The simplest solution - always acquire locks in sorted order:
+
+```java
+public class LockManagerV1 {
+    
+    // Map of resource ID to its lock
+    private final ConcurrentHashMap<String, ReentrantLock> locks;
+    
+    public LockManagerV1() {
+        this.locks = new ConcurrentHashMap<>();
+    }
+    
+    // Acquire multiple locks
+    public boolean acquireLocks(List<String> resourceIds) 
+            throws InterruptedException {
+        
+        // KEY: Sort resources to ensure consistent order
+        List<String> sorted = new ArrayList<>(resourceIds);
+        Collections.sort(sorted);
+        
+        // Acquire in order
+        for (String resourceId : sorted) {
+            ReentrantLock lock = locks.computeIfAbsent(
+                resourceId, 
+                id -> new ReentrantLock()
+            );
+            lock.lockInterruptibly();
+        }
+        
+        return true;
+    }
+    
+    // Release locks
+    public void releaseLocks(List<String> resourceIds) {
+        for (String resourceId : resourceIds) {
+            ReentrantLock lock = locks.get(resourceId);
+            if (lock != null && lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+}
+```
+
+**Why this works**:
+
+```
+Thread-1 wants: [Database, FileSystem]
+Thread-2 wants: [FileSystem, Database]
+
+Without sorting:
+Thread-1: Lock Database → Wait for FileSystem
+Thread-2: Lock FileSystem → Wait for Database
+DEADLOCK!
+
+With sorting (alphabetical):
+Both sort to: [Database, FileSystem]
+
+Thread-1: Lock Database → Lock FileSystem ✓
+Thread-2: Wait for Database → Eventually gets both ✓
+NO DEADLOCK!
+```
+
+---
+
+## Approach 2: Timeout-Based Acquisition
+
+**Me**: "Let's add timeout support:
+
+```java
+public class LockManagerV2 {
+    
+    private final ConcurrentHashMap<String, ReentrantLock> locks;
+    
+    public LockManagerV2() {
+        this.locks = new ConcurrentHashMap<>();
+    }
+    
+    public boolean acquireLocks(List<String> resourceIds, long timeoutMs) 
+            throws InterruptedException {
+        
+        // Sort for consistent ordering
+        List<String> sorted = new ArrayList<>(resourceIds);
+        Collections.sort(sorted);
+        
+        List<ReentrantLock> acquired = new ArrayList<>();
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        
+        try {
+            for (String resourceId : sorted) {
+                long remaining = deadline - System.currentTimeMillis();
+                
+                if (remaining <= 0) {
+                    // Timeout expired
+                    System.out.println(Thread.currentThread().getName() + 
+                        " TIMEOUT acquiring " + resourceId);
+                    return false;
+                }
+                
+                ReentrantLock lock = locks.computeIfAbsent(
+                    resourceId, 
+                    id -> new ReentrantLock()
+                );
+                
+                // Try with remaining time
+                if (!lock.tryLock(remaining, TimeUnit.MILLISECONDS)) {
+                    System.out.println(Thread.currentThread().getName() + 
+                        " TIMEOUT on " + resourceId);
+                    return false;
+                }
+                
+                acquired.add(lock);
+                System.out.println(Thread.currentThread().getName() + 
+                    " acquired " + resourceId);
+            }
+            
+            return true;
+            
+        } finally {
+            // Always release acquired locks if we didn't get all
+            if (acquired.size() < sorted.size()) {
+                System.out.println(Thread.currentThread().getName() + 
+                    " releasing " + acquired.size() + " locks (partial acquisition)");
+                for (ReentrantLock lock : acquired) {
+                    lock.unlock();
+                }
+            }
+        }
+    }
+    
+    public void releaseLocks(List<String> resourceIds) {
+        for (String resourceId : resourceIds) {
+            ReentrantLock lock = locks.get(resourceId);
+            if (lock != null && lock.isHeldByCurrentThread()) {
+                lock.unlock();
+                System.out.println(Thread.currentThread().getName() + 
+                    " released " + resourceId);
+            }
+        }
+    }
+}
+```
+
+---
+
+## Approach 3: All-or-Nothing with Retry
+
+**Me**: "Let's add exponential backoff retry:
+
+```java
+public class LockManagerV3 {
+    
+    private final ConcurrentHashMap<String, ReentrantLock> locks;
+    private final int maxRetries;
+    private final long baseBackoffMs;
+    
+    public LockManagerV3(int maxRetries, long baseBackoffMs) {
+        this.locks = new ConcurrentHashMap<>();
+        this.maxRetries = maxRetries;
+        this.baseBackoffMs = baseBackoffMs;
+    }
+    
+    public boolean acquireLocksWithRetry(List<String> resourceIds) 
+            throws InterruptedException {
+        
+        for (int attempt = 0; attempt < maxRetries; attempt++) {
+            if (tryAcquireAll(resourceIds)) {
+                return true;
+            }
+            
+            // Exponential backoff
+            long backoff = baseBackoffMs * (1L << attempt);  // 2^attempt
+            System.out.println(Thread.currentThread().getName() + 
+                " retry attempt " + attempt + ", backing off " + backoff + "ms");
+            Thread.sleep(backoff);
+        }
+        
+        return false;  // Failed after all retries
+    }
+    
+    private boolean tryAcquireAll(List<String> resourceIds) 
+            throws InterruptedException {
+        
+        List<String> sorted = new ArrayList<>(resourceIds);
+        Collections.sort(sorted);
+        
+        List<ReentrantLock> acquired = new ArrayList<>();
+        
+        try {
+            for (String resourceId : sorted) {
+                ReentrantLock lock = locks.computeIfAbsent(
+                    resourceId, 
+                    id -> new ReentrantLock()
+                );
+                
+                // Try immediately, don't wait
+                if (!lock.tryLock()) {
+                    // Failed to acquire, release all and return false
+                    return false;
+                }
+                
+                acquired.add(lock);
+            }
+            
+            // Success - acquired all locks!
+            return true;
+            
+        } finally {
+            // Release if didn't get all
+            if (acquired.size() < sorted.size()) {
+                for (ReentrantLock lock : acquired) {
+                    lock.unlock();
+                }
+            }
+        }
+    }
+    
+    public void releaseLocks(List<String> resourceIds) {
+        for (String resourceId : resourceIds) {
+            ReentrantLock lock = locks.get(resourceId);
+            if (lock != null && lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+}
+```
+
+---
+
+## Approach 4: Deadlock Detection (Advanced)
+
+**Me**: "We can build a wait-for graph and detect cycles:
+
+```java
+public class LockManagerV4 {
+    
+    private final ConcurrentHashMap<String, LockInfo> locks;
+    private final ConcurrentHashMap<String, Set<String>> waitGraph;
+    
+    static class LockInfo {
+        final ReentrantLock lock = new ReentrantLock();
+        volatile String holder;  // Thread ID holding lock
+        final Set<String> waiters = ConcurrentHashMap.newKeySet();
+    }
+    
+    public LockManagerV4() {
+        this.locks = new ConcurrentHashMap<>();
+        this.waitGraph = new ConcurrentHashMap<>();
+    }
+    
+    public boolean acquireLocks(List<String> resourceIds, long timeoutMs) 
+            throws InterruptedException {
+        
+        String threadId = Thread.currentThread().getName();
+        List<String> sorted = new ArrayList<>(resourceIds);
+        Collections.sort(sorted);
+        
+        List<String> acquired = new ArrayList<>();
+        
+        try {
+            for (String resourceId : sorted) {
+                LockInfo info = locks.computeIfAbsent(
+                    resourceId, 
+                    id -> new LockInfo()
+                );
+                
+                // Check for potential deadlock BEFORE waiting
+                if (wouldCauseDeadlock(threadId, resourceId)) {
+                    System.out.println("❌ DEADLOCK DETECTED! " + threadId + 
+                        " cannot acquire " + resourceId);
+                    return false;
+                }
+                
+                // Add to wait graph
+                info.waiters.add(threadId);
+                waitGraph.computeIfAbsent(threadId, k -> ConcurrentHashMap.newKeySet())
+                    .add(resourceId);
+                
+                // Try to acquire
+                if (!info.lock.tryLock(timeoutMs, TimeUnit.MILLISECONDS)) {
+                    // Timeout
+                    info.waiters.remove(threadId);
+                    waitGraph.get(threadId).remove(resourceId);
+                    return false;
+                }
+                
+                // Acquired!
+                info.holder = threadId;
+                info.waiters.remove(threadId);
+                waitGraph.get(threadId).remove(resourceId);
+                acquired.add(resourceId);
+                
+                System.out.println("✓ " + threadId + " acquired " + resourceId);
+            }
+            
+            return true;
+            
+        } catch (InterruptedException e) {
+            // Cleanup
+            for (String resourceId : acquired) {
+                releaseLock(resourceId);
+            }
+            throw e;
+        }
+    }
+    
+    private boolean wouldCauseDeadlock(String threadId, String resourceId) {
+        LockInfo info = locks.get(resourceId);
+        if (info == null || info.holder == null) {
+            return false;  // Not held, can't cause deadlock
+        }
+        
+        // Check if there's a path from resource holder back to this thread
+        return hasPath(info.holder, threadId, new HashSet<>());
+    }
+    
+    private boolean hasPath(String from, String to, Set<String> visited) {
+        if (from.equals(to)) {
+            return true;  // Cycle found!
+        }
+        
+        if (visited.contains(from)) {
+            return false;  // Already checked
+        }
+        
+        visited.add(from);
+        
+        // Check what resources 'from' thread is waiting for
+        Set<String> waitingFor = waitGraph.get(from);
+        if (waitingFor == null) {
+            return false;
+        }
+        
+        // For each resource, check who holds it
+        for (String resource : waitingFor) {
+            LockInfo info = locks.get(resource);
+            if (info != null && info.holder != null) {
+                if (hasPath(info.holder, to, visited)) {
+                    return true;  // Found path through this holder
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    private void releaseLock(String resourceId) {
+        LockInfo info = locks.get(resourceId);
+        if (info != null) {
+            info.holder = null;
+            info.lock.unlock();
+        }
+    }
+    
+    public void releaseLocks(List<String> resourceIds) {
+        String threadId = Thread.currentThread().getName();
+        for (String resourceId : resourceIds) {
+            LockInfo info = locks.get(resourceId);
+            if (info != null && threadId.equals(info.holder)) {
+                releaseLock(resourceId);
+                System.out.println("✓ " + threadId + " released " + resourceId);
+            }
+        }
+    }
+}
+```
+
+---
+
+## Production-Ready Implementation
+
+**Me**: "Here's a complete, production-ready version:
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
+
+public class DistributedLockManager {
+    
+    // Lock registry
+    private final ConcurrentHashMap<String, LockInfo> locks;
+    
+    // Configuration
+    private final long defaultTimeoutMs;
+    private final int maxRetries;
+    
+    // Statistics
+    private final AtomicLong successfulAcquisitions = new AtomicLong(0);
+    private final AtomicLong failedAcquisitions = new AtomicLong(0);
+    private final AtomicLong deadlocksDetected = new AtomicLong(0);
+    
+    static class LockInfo {
+        final ReentrantLock lock;
+        volatile String holder;
+        final AtomicLong acquisitions = new AtomicLong(0);
+        final Set<String> waiters = ConcurrentHashMap.newKeySet();
+        
+        LockInfo() {
+            this.lock = new ReentrantLock(true);  // Fair lock
+        }
+    }
+    
+    public DistributedLockManager(long defaultTimeoutMs, int maxRetries) {
+        this.locks = new ConcurrentHashMap<>();
+        this.defaultTimeoutMs = defaultTimeoutMs;
+        this.maxRetries = maxRetries;
+    }
+    
+    /**
+     * Acquire multiple locks atomically with retry
+     */
+    public boolean acquireLocks(List<String> resourceIds) 
+            throws InterruptedException {
+        return acquireLocksWithTimeout(resourceIds, defaultTimeoutMs);
+    }
+    
+    public boolean acquireLocksWithTimeout(List<String> resourceIds, long timeoutMs) 
+            throws InterruptedException {
+        
+        if (resourceIds == null || resourceIds.isEmpty()) {
+            throw new IllegalArgumentException("Resource IDs cannot be empty");
+        }
+        
+        // Try with exponential backoff
+        long baseBackoff = 10;  // Start with 10ms
+        
+        for (int attempt = 0; attempt < maxRetries; attempt++) {
+            if (tryAcquireAllLocks(resourceIds, timeoutMs)) {
+                successfulAcquisitions.incrementAndGet();
+                return true;
+            }
+            
+            // Failed, back off before retry
+            if (attempt < maxRetries - 1) {
+                long backoff = baseBackoff * (1L << attempt);
+                System.out.println(Thread.currentThread().getName() + 
+                    " retry " + attempt + ", backing off " + backoff + "ms");
+                Thread.sleep(backoff);
+            }
+        }
+        
+        failedAcquisitions.incrementAndGet();
+        return false;
+    }
+    
+    private boolean tryAcquireAllLocks(List<String> resourceIds, long timeoutMs) 
+            throws InterruptedException {
+        
+        String threadId = Thread.currentThread().getName();
+        
+        // Sort for consistent ordering (deadlock prevention)
+        List<String> sorted = new ArrayList<>(resourceIds);
+        Collections.sort(sorted);
+        
+        List<String> acquired = new ArrayList<>();
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        
+        try {
+            for (String resourceId : sorted) {
+                long remaining = deadline - System.currentTimeMillis();
+                
+                if (remaining <= 0) {
+                    System.out.println(threadId + " timeout expired");
+                    return false;
+                }
+                
+                LockInfo info = locks.computeIfAbsent(
+                    resourceId, 
+                    id -> new LockInfo()
+                );
+                
+                // Try to acquire with remaining time
+                if (!info.lock.tryLock(remaining, TimeUnit.MILLISECONDS)) {
+                    System.out.println(threadId + " timeout on " + resourceId);
+                    return false;
+                }
+                
+                // Acquired!
+                info.holder = threadId;
+                info.acquisitions.incrementAndGet();
+                acquired.add(resourceId);
+                
+                System.out.println(threadId + " acquired " + resourceId);
+            }
+            
+            // Success - acquired all locks
+            return true;
+            
+        } finally {
+            // If didn't acquire all, release what we got
+            if (acquired.size() < sorted.size()) {
+                System.out.println(threadId + " releasing " + acquired.size() + 
+                    " locks (partial acquisition)");
+                    
+                for (String resourceId : acquired) {
+                    LockInfo info = locks.get(resourceId);
+                    if (info != null) {
+                        info.holder = null;
+                        info.lock.unlock();
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * Release locks
+     */
+    public void releaseLocks(List<String> resourceIds) {
+        String threadId = Thread.currentThread().getName();
+        
+        for (String resourceId : resourceIds) {
+            LockInfo info = locks.get(resourceId);
+            
+            if (info != null && info.lock.isHeldByCurrentThread()) {
+                info.holder = null;
+                info.lock.unlock();
+                System.out.println(threadId + " released " + resourceId);
+            }
+        }
+    }
+    
+    /**
+     * Check if thread holds lock
+     */
+    public boolean holdsLock(String resourceId) {
+        LockInfo info = locks.get(resourceId);
+        return info != null && info.lock.isHeldByCurrentThread();
+    }
+    
+    /**
+     * Get lock statistics
+     */
+    public Map<String, Object> getStatistics() {
+        Map<String, Object> stats = new HashMap<>();
+        stats.put("totalLocks", locks.size());
+        stats.put("successfulAcquisitions", successfulAcquisitions.get());
+        stats.put("failedAcquisitions", failedAcquisitions.get());
+        stats.put("deadlocksDetected", deadlocksDetected.get());
+        
+        // Per-lock stats
+        Map<String, Long> perLock = new HashMap<>();
+        for (Map.Entry<String, LockInfo> entry : locks.entrySet()) {
+            perLock.put(entry.getKey(), entry.getValue().acquisitions.get());
+        }
+        stats.put("perLockAcquisitions", perLock);
+        
+        return stats;
+    }
+    
+    /**
+     * Get current lock holders
+     */
+    public Map<String, String> getCurrentHolders() {
+        Map<String, String> holders = new HashMap<>();
+        for (Map.Entry<String, LockInfo> entry : locks.entrySet()) {
+            if (entry.getValue().holder != null) {
+                holders.put(entry.getKey(), entry.getValue().holder);
+            }
+        }
+        return holders;
+    }
+    
+    // Test
+    public static void main(String[] args) throws InterruptedException {
+        DistributedLockManager manager = new DistributedLockManager(5000, 3);
+        
+        ExecutorService executor = Executors.newFixedThreadPool(5);
+        CountDownLatch latch = new CountDownLatch(5);
+        
+        // Simulate concurrent lock acquisitions
+        for (int i = 0; i < 5; i++) {
+            final int threadNum = i;
+            executor.submit(() -> {
+                try {
+                    List<String> resources = Arrays.asList(
+                        "resource-" + (threadNum % 3),
+                        "resource-" + ((threadNum + 1) % 3)
+                    );
+                    
+                    if (manager.acquireLocks(resources)) {
+                        System.out.println(Thread.currentThread().getName() + 
+                            " doing work...");
+                        Thread.sleep(100);  // Simulate work
+                        manager.releaseLocks(resources);
+                    } else {
+                        System.out.println(Thread.currentThread().getName() + 
+                            " failed to acquire locks");
+                    }
+                    
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+        
+        latch.await();
+        executor.shutdown();
+        
+        System.out.println("\n=== Statistics ===");
+        manager.getStatistics().forEach((key, value) -> 
+            System.out.println(key + ": " + value));
+    }
+}
+```
+
+---
+
+## Summary: Key Takeaways
+
+**Me**: "To wrap up:
+
+### Core Concepts:
+1. **Deadlock happens** when circular wait exists
+2. **Prevention**: Lock ordering (simplest)
+3. **Detection**: Wait-for graph + cycle detection (complex)
+4. **Timeout**: Fail fast, retry with backoff
+5. **All-or-nothing**: Acquire all or release all
+
+### Best Practices:
+```java
+✓ Always sort resources before acquiring
+✓ Use try-finally for release
+✓ Support timeout for bounded waiting
+✓ Add retry with exponential backoff
+✓ Track statistics for monitoring
+✓ Handle InterruptedException properly
+✓ Consider fairness (ReentrantLock(true))
+```
+
+### When to Use:
+- Multiple resource coordination
+- Database transaction management
+- Resource allocation systems
+- Distributed systems (with external coordinator)
+
+### Interview Strategy:
+1. Start with simple lock ordering
+2. Add timeout if asked
+3. Discuss deadlock detection if time permits
+4. Show awareness of distributed challenges
+5. Talk about testing and edge cases
+
+The key insight: **Prevention (lock ordering) is simpler and faster than detection (graph cycles)**. Use detection only when ordering isn't possible."
+
+---
+
+**END OF DOCUMENT**
