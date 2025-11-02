@@ -7408,4 +7408,1325 @@ public class MonitoredQueue<T> {
 // If average wait time is high → backpressure is happening
 ```
 
+# Remaining Concurrency Design Problems - Part 3
+
 ---
+
+# Write-Behind Cache
+
+## Problem Introduction
+
+**Interviewer**: "Design a write-behind cache where writes go to cache immediately but are asynchronously written to the database in batches."
+
+**Me**: "Interesting pattern! Let me clarify:
+
+**Concept**:
+```
+Write-Through Cache (Slow):
+Application → Cache → Wait for DB write → Return
+Latency: ~100ms (DB write time)
+
+Write-Behind Cache (Fast):
+Application → Cache → Return immediately
+Background: Cache → Batch writes to DB
+Latency: ~1ms (memory write)
+
+Benefits:
+- Fast writes (don't wait for DB)
+- Batch writes (fewer DB calls)
+- Coalesce writes (same key updated multiple times)
+
+Risks:
+- Data loss if crash before flush
+- Eventual consistency
+```
+
+**Questions**:
+1. **Flush strategy**: Time-based, size-based, or both?
+2. **Failure handling**: Retry, dead letter, or alert?
+3. **Ordering**: Preserve write order per key?
+4. **Coalescing**: Merge multiple writes to same key?
+5. **Consistency**: Read-your-writes guarantee?
+
+**Assumptions**:
+- Time + size based flushing
+- Retry with exponential backoff
+- Order preserved per key
+- Coalesce writes (keep latest)
+- Read-your-writes (read from cache first)
+
+Sound good?"
+
+**Interviewer**: "Yes, focus on the async write mechanism."
+
+---
+
+## High-Level Design
+
+**Me**: "Here's the architecture:
+
+### Components:
+```
+┌─────────────────────────────────────────┐
+│          Write-Behind Cache             │
+├─────────────────────────────────────────┤
+│  Cache (ConcurrentHashMap)              │
+│  ├── Key → CacheEntry                   │
+│  │   ├── Value                          │
+│  │   ├── isDirty flag                   │
+│  │   └── lastModified                   │
+├─────────────────────────────────────────┤
+│  Dirty Keys Queue (for flush)           │
+│  ├── Keys pending DB write              │
+├─────────────────────────────────────────┤
+│  Background Flusher Thread               │
+│  ├── Batches dirty keys                 │
+│  ├── Writes to DB                       │
+│  └── Retries on failure                 │
+└─────────────────────────────────────────┘
+```
+
+### Write Flow:
+```
+1. put(key, value)
+   ├─> Update cache (fast!)
+   ├─> Mark as dirty
+   ├─> Add to dirty queue
+   └─> Return immediately
+
+2. Background Flusher
+   ├─> Collect batch of dirty keys
+   ├─> Write batch to DB
+   └─> Mark as clean on success
+```
+
+### Key Design Decisions:
+- Use `ConcurrentHashMap` for cache
+- Use `ConcurrentLinkedQueue` for dirty keys
+- Coalesce: Only keep latest value per key"
+
+---
+
+## Implementation
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class WriteBehindCache<K, V> {
+    
+    // Cache entry with metadata
+    static class CacheEntry<V> {
+        final V value;
+        final long timestamp;
+        volatile boolean isDirty;
+        
+        CacheEntry(V value) {
+            this.value = value;
+            this.timestamp = System.currentTimeMillis();
+            this.isDirty = true;
+        }
+    }
+    
+    // Database interface
+    public interface Database<K, V> {
+        void writeBatch(Map<K, V> batch) throws Exception;
+        V read(K key) throws Exception;
+    }
+    
+    private final ConcurrentHashMap<K, CacheEntry<V>> cache;
+    private final Set<K> dirtyKeys;  // Keys pending flush
+    private final Database<K, V> database;
+    
+    // Configuration
+    private final int maxBatchSize;
+    private final long flushIntervalMs;
+    
+    // Background flusher
+    private final ScheduledExecutorService flusher;
+    private volatile boolean shutdown = false;
+    
+    // Statistics
+    private final AtomicLong cacheHits = new AtomicLong(0);
+    private final AtomicLong cacheMisses = new AtomicLong(0);
+    private final AtomicLong writes = new AtomicLong(0);
+    private final AtomicLong flushes = new AtomicLong(0);
+    private final AtomicLong flushFailures = new AtomicLong(0);
+    
+    public WriteBehindCache(Database<K, V> database, 
+                            int maxBatchSize, 
+                            long flushIntervalMs) {
+        this.database = database;
+        this.maxBatchSize = maxBatchSize;
+        this.flushIntervalMs = flushIntervalMs;
+        
+        this.cache = new ConcurrentHashMap<>();
+        this.dirtyKeys = ConcurrentHashMap.newKeySet();
+        
+        // Background flusher
+        this.flusher = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "CacheFlusher");
+            t.setDaemon(true);
+            return t;
+        });
+        
+        flusher.scheduleAtFixedRate(
+            this::flushDirtyKeys,
+            flushIntervalMs,
+            flushIntervalMs,
+            TimeUnit.MILLISECONDS
+        );
+    }
+    
+    /**
+     * Write to cache (returns immediately)
+     */
+    public void put(K key, V value) {
+        if (key == null || value == null) {
+            throw new IllegalArgumentException("Key and value cannot be null");
+        }
+        
+        CacheEntry<V> entry = new CacheEntry<>(value);
+        cache.put(key, entry);
+        dirtyKeys.add(key);
+        writes.incrementAndGet();
+        
+        System.out.println("PUT: " + key + " (dirty keys: " + dirtyKeys.size() + ")");
+        
+        // Check if batch size reached
+        if (dirtyKeys.size() >= maxBatchSize) {
+            // Trigger immediate flush
+            flusher.execute(this::flushDirtyKeys);
+        }
+    }
+    
+    /**
+     * Read from cache, fallback to DB
+     */
+    public V get(K key) {
+        CacheEntry<V> entry = cache.get(key);
+        
+        if (entry != null) {
+            cacheHits.incrementAndGet();
+            System.out.println("GET: " + key + " - CACHE HIT" + 
+                (entry.isDirty ? " (dirty)" : " (clean)"));
+            return entry.value;
+        }
+        
+        // Cache miss - load from DB
+        cacheMisses.incrementAndGet();
+        System.out.println("GET: " + key + " - CACHE MISS, loading from DB");
+        
+        try {
+            V value = database.read(key);
+            if (value != null) {
+                // Cache it
+                CacheEntry<V> newEntry = new CacheEntry<>(value);
+                newEntry.isDirty = false;  // Clean (from DB)
+                cache.put(key, newEntry);
+            }
+            return value;
+        } catch (Exception e) {
+            System.err.println("Error reading from DB: " + e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Force flush all dirty keys
+     */
+    public void flush() {
+        flushDirtyKeys();
+    }
+    
+    /**
+     * Background flush operation
+     */
+    private void flushDirtyKeys() {
+        if (dirtyKeys.isEmpty()) {
+            return;
+        }
+        
+        // Collect batch of dirty keys
+        Set<K> keysToFlush = new HashSet<>();
+        Iterator<K> iterator = dirtyKeys.iterator();
+        
+        while (iterator.hasNext() && keysToFlush.size() < maxBatchSize) {
+            K key = iterator.next();
+            keysToFlush.add(key);
+        }
+        
+        if (keysToFlush.isEmpty()) {
+            return;
+        }
+        
+        System.out.println("\n=== FLUSHING " + keysToFlush.size() + " keys ===");
+        
+        // Build batch
+        Map<K, V> batch = new HashMap<>();
+        for (K key : keysToFlush) {
+            CacheEntry<V> entry = cache.get(key);
+            if (entry != null && entry.isDirty) {
+                batch.put(key, entry.value);
+            }
+        }
+        
+        // Write batch to DB
+        try {
+            database.writeBatch(batch);
+            flushes.incrementAndGet();
+            
+            // Mark as clean
+            for (K key : batch.keySet()) {
+                CacheEntry<V> entry = cache.get(key);
+                if (entry != null) {
+                    entry.isDirty = false;
+                }
+                dirtyKeys.remove(key);
+            }
+            
+            System.out.println("Flush successful: " + batch.size() + " keys written");
+            
+        } catch (Exception e) {
+            System.err.println("Flush failed: " + e.getMessage());
+            flushFailures.incrementAndGet();
+            
+            // Retry logic would go here
+            retryFlush(batch, 1);
+        }
+    }
+    
+    /**
+     * Retry failed flush with exponential backoff
+     */
+    private void retryFlush(Map<K, V> batch, int attempt) {
+        if (attempt > 3) {
+            System.err.println("Max retries exceeded, giving up on batch");
+            // Send to dead letter queue in production
+            return;
+        }
+        
+        long delayMs = 1000 * (1L << attempt);  // Exponential backoff
+        System.out.println("Scheduling retry #" + attempt + " in " + delayMs + "ms");
+        
+        flusher.schedule(() -> {
+            try {
+                database.writeBatch(batch);
+                flushes.incrementAndGet();
+                
+                // Mark as clean
+                for (K key : batch.keySet()) {
+                    CacheEntry<V> entry = cache.get(key);
+                    if (entry != null) {
+                        entry.isDirty = false;
+                    }
+                    dirtyKeys.remove(key);
+                }
+                
+                System.out.println("Retry #" + attempt + " successful");
+                
+            } catch (Exception e) {
+                System.err.println("Retry #" + attempt + " failed: " + e.getMessage());
+                retryFlush(batch, attempt + 1);
+            }
+        }, delayMs, TimeUnit.MILLISECONDS);
+    }
+    
+    public void shutdown() throws InterruptedException {
+        shutdown = true;
+        
+        // Final flush
+        System.out.println("\nShutdown: flushing remaining dirty keys");
+        flushDirtyKeys();
+        
+        flusher.shutdown();
+        flusher.awaitTermination(10, TimeUnit.SECONDS);
+        
+        System.out.println("Write-behind cache shut down");
+    }
+    
+    public Map<String, Object> getStatistics() {
+        Map<String, Object> stats = new HashMap<>();
+        stats.put("cacheSize", cache.size());
+        stats.put("dirtyKeys", dirtyKeys.size());
+        stats.put("cacheHits", cacheHits.get());
+        stats.put("cacheMisses", cacheMisses.get());
+        stats.put("writes", writes.get());
+        stats.put("flushes", flushes.get());
+        stats.put("flushFailures", flushFailures.get());
+        
+        long totalReads = cacheHits.get() + cacheMisses.get();
+        stats.put("hitRate", totalReads == 0 ? 0 : (cacheHits.get() * 100 / totalReads));
+        
+        return stats;
+    }
+    
+    // Test with mock database
+    public static void main(String[] args) throws InterruptedException {
+        // Mock database
+        Database<String, String> db = new Database<String, String>() {
+            private final ConcurrentHashMap<String, String> storage = new ConcurrentHashMap<>();
+            
+            @Override
+            public void writeBatch(Map<String, String> batch) throws Exception {
+                System.out.println("  [DB] Writing batch of " + batch.size() + " items");
+                Thread.sleep(100);  // Simulate slow DB write
+                storage.putAll(batch);
+            }
+            
+            @Override
+            public String read(String key) throws Exception {
+                System.out.println("  [DB] Reading key: " + key);
+                Thread.sleep(50);  // Simulate slow DB read
+                return storage.get(key);
+            }
+        };
+        
+        WriteBehindCache<String, String> cache = new WriteBehindCache<>(
+            db,
+            5,      // Batch size
+            2000    // Flush interval: 2 seconds
+        );
+        
+        System.out.println("=== Scenario 1: Fast Writes ===");
+        // Multiple fast writes
+        for (int i = 0; i < 3; i++) {
+            cache.put("key" + i, "value" + i);
+            Thread.sleep(50);
+        }
+        
+        // Read immediately (should hit cache)
+        System.out.println("\nReading from cache:");
+        System.out.println("key0 = " + cache.get("key0"));
+        System.out.println("key1 = " + cache.get("key1"));
+        
+        System.out.println("\n=== Scenario 2: Size-Based Flush ===");
+        // Trigger size-based flush
+        for (int i = 10; i < 16; i++) {
+            cache.put("key" + i, "value" + i);
+            Thread.sleep(50);
+        }
+        
+        Thread.sleep(500);  // Wait for flush to complete
+        
+        System.out.println("\n=== Scenario 3: Coalescing Writes ===");
+        // Multiple writes to same key
+        cache.put("coalesce", "v1");
+        cache.put("coalesce", "v2");
+        cache.put("coalesce", "v3");  // Only v3 should be written to DB
+        
+        Thread.sleep(3000);  // Wait for time-based flush
+        
+        System.out.println("\n=== Statistics ===");
+        cache.getStatistics().forEach((key, value) -> 
+            System.out.println(key + ": " + value));
+        
+        cache.shutdown();
+    }
+}
+```
+
+---
+
+## Pitfalls and Edge Cases
+
+**Me**: "Key gotchas to watch for:
+
+### Pitfall 1: Lost Writes on Crash
+
+```java
+// Problem: Cache has dirty data, system crashes
+cache.put("key", "value");  // In cache, not in DB yet
+// CRASH! Data lost!
+
+// Solution 1: Write-Ahead Log (WAL)
+public void put(K key, V value) {
+    // Write to WAL first (durable)
+    wal.append(new WriteOperation(key, value));
+    
+    // Then update cache
+    cache.put(key, new CacheEntry<>(value));
+    dirtyKeys.add(key);
+}
+
+// On recovery:
+public void recover() {
+    for (WriteOperation op : wal.replay()) {
+        database.write(op.key, op.value);
+    }
+}
+
+// Solution 2: Hybrid Write-Through for Critical Data
+public void put(K key, V value, boolean critical) {
+    cache.put(key, new CacheEntry<>(value));
+    
+    if (critical) {
+        // Write-through for critical data
+        database.write(key, value);
+    } else {
+        // Write-behind for non-critical
+        dirtyKeys.add(key);
+    }
+}
+```
+
+### Pitfall 2: Stale Reads After External DB Update
+
+```java
+// Problem:
+cache.put("key", "value1");     // Cache: value1, DB: (pending)
+externalSystem.update("key", "value2");  // DB: value2
+cache.get("key");  // Returns value1 (stale!)
+
+// Solution: Cache Invalidation
+public void invalidate(K key) {
+    cache.remove(key);
+    dirtyKeys.remove(key);
+}
+
+// Or: TTL on cache entries
+if (System.currentTimeMillis() - entry.timestamp > TTL) {
+    cache.remove(key);  // Expired, reload from DB
+}
+```
+
+### Pitfall 3: Memory Leak with Unbounded Dirty Keys
+
+```java
+// ❌ WRONG - Dirty keys can accumulate if flush fails
+if (database.writeBatch(batch) fails) {
+    // Keys remain in dirtyKeys forever!
+    // Memory leak!
+}
+
+// ✓ CORRECT - Bounded retry, then drop
+private void retryFlush(Map<K, V> batch, int attempt) {
+    if (attempt > MAX_RETRIES) {
+        // Give up, send to dead letter queue
+        deadLetterQueue.addAll(batch.entrySet());
+        
+        // Remove from dirty keys
+        for (K key : batch.keySet()) {
+            dirtyKeys.remove(key);
+        }
+        return;
+    }
+    // Retry...
+}
+```
+
+### Pitfall 4: Concurrent Modification During Flush
+
+```java
+// Problem:
+Thread 1 (Flusher): Reading entry.value
+Thread 2 (Writer):  cache.put(key, newValue) - updates same entry
+
+// Solution: Snapshot the value
+private void flushDirtyKeys() {
+    Map<K, V> batch = new HashMap<>();
+    
+    for (K key : keysToFlush) {
+        CacheEntry<V> entry = cache.get(key);
+        if (entry != null && entry.isDirty) {
+            // Snapshot value at flush time
+            batch.put(key, entry.value);
+        }
+    }
+    
+    // Write snapshot (immune to concurrent updates)
+    database.writeBatch(batch);
+}
+```
+
+### Pitfall 5: Read-After-Write Consistency
+
+```java
+// Problem: Different threads, different views
+Thread 1: cache.put("key", "value");  // Cache updated
+Thread 2: db.read("key");  // Returns old value (not flushed yet)
+
+// Solution: Always read from cache first
+public V get(K key) {
+    // Check cache first (includes dirty data)
+    CacheEntry<V> entry = cache.get(key);
+    if (entry != null) {
+        return entry.value;  // Read-your-writes!
+    }
+    
+    // Cache miss, load from DB
+    return database.read(key);
+}
+```
+
+### Pitfall 6: Ordering Issues with Multiple Keys
+
+```java
+// Problem: Order not preserved across keys
+cache.put("account", "100");
+cache.put("balance", "50");
+
+// Flush happens in arbitrary order
+// DB might see balance=50 before account=100!
+
+// Solution: Transaction groups
+public void putBatch(Map<K, V> batch) {
+    String txId = UUID.randomUUID().toString();
+    
+    for (Map.Entry<K, V> entry : batch.entrySet()) {
+        CacheEntry<V> ce = new CacheEntry<>(entry.getValue());
+        ce.transactionId = txId;
+        cache.put(entry.getKey(), ce);
+        dirtyKeys.add(entry.getKey());
+    }
+}
+
+// Flush keeps transaction together
+private void flushDirtyKeys() {
+    // Group by transaction ID
+    Map<String, Map<K, V>> txBatches = groupByTransaction();
+    
+    for (Map<K, V> txBatch : txBatches.values()) {
+        database.writeTransaction(txBatch);  // Atomic
+    }
+}
+```
+"
+
+---
+
+## Advanced: Write-Behind with Write Coalescing
+
+**Me**: "Optimized version that coalesces multiple writes:
+
+```java
+public class CoalescingWriteBehindCache<K, V> {
+    
+    static class CacheEntry<V> {
+        volatile V value;  // Mutable for coalescing
+        final AtomicLong version;  // Track updates
+        volatile boolean isDirty;
+        
+        CacheEntry(V value) {
+            this.value = value;
+            this.version = new AtomicLong(1);
+            this.isDirty = true;
+        }
+        
+        void update(V newValue) {
+            this.value = newValue;
+            this.version.incrementAndGet();
+            this.isDirty = true;
+        }
+    }
+    
+    public void put(K key, V value) {
+        CacheEntry<V> entry = cache.get(key);
+        
+        if (entry != null) {
+            // Key exists, coalesce write
+            entry.update(value);
+            System.out.println("PUT: " + key + " - COALESCED (version: " + 
+                entry.version.get() + ")");
+        } else {
+            // New key
+            entry = new CacheEntry<>(value);
+            cache.put(key, entry);
+            dirtyKeys.add(key);
+            System.out.println("PUT: " + key + " - NEW");
+        }
+        
+        writes.incrementAndGet();
+    }
+    
+    // When flushing, only latest value is written
+    // Multiple writes to same key = single DB write!
+}
+```
+
+**Benefits**:
+- Multiple updates to same key = single DB write
+- Reduces DB load significantly
+- Example: 1000 updates to same key = 1 DB write
+
+**Trade-off**:
+- Intermediate values never written to DB
+- Only latest value persists
+- Fine for most use cases (e.g., session data, counters)
+"
+
+---
+
+## Interview Follow-Up Questions
+
+**Q1: How to implement write-behind for delete operations?**
+
+```java
+public void delete(K key) {
+    cache.remove(key);
+    
+    // Add to delete queue
+    keysToDelete.add(key);
+}
+
+private void flushDeletes() {
+    Set<K> batch = new HashSet<>();
+    Iterator<K> iter = keysToDelete.iterator();
+    
+    while (iter.hasNext() && batch.size() < maxBatchSize) {
+        batch.add(iter.next());
+    }
+    
+    database.deleteBatch(batch);
+    keysToDelete.removeAll(batch);
+}
+```
+
+**Q2: How to handle cache eviction of dirty data?**
+
+```java
+class EvictionListener implements RemovalListener<K, CacheEntry<V>> {
+    @Override
+    public void onRemoval(K key, CacheEntry<V> entry) {
+        if (entry.isDirty) {
+            // Dirty data being evicted!
+            // Option 1: Flush immediately
+            database.write(key, entry.value);
+            
+            // Option 2: Add to priority flush queue
+            urgentFlushQueue.add(key);
+            
+            // Option 3: Prevent eviction of dirty data
+            throw new IllegalStateException("Cannot evict dirty data");
+        }
+    }
+}
+```
+
+**Q3: How to test write-behind cache?**
+
+```java
+@Test
+public void testWriteCoalescing() throws InterruptedException {
+    MockDatabase db = new MockDatabase();
+    WriteBehindCache<String, String> cache = 
+        new WriteBehindCache<>(db, 10, 1000);
+    
+    // Multiple writes to same key
+    cache.put("key", "v1");
+    cache.put("key", "v2");
+    cache.put("key", "v3");
+    
+    // Force flush
+    cache.flush();
+    
+    // Verify only one DB write
+    assertEquals(1, db.getWriteCount("key"));
+    assertEquals("v3", db.read("key"));  // Latest value
+}
+
+@Test
+public void testReadYourWrites() {
+    cache.put("key", "value");
+    
+    // Should read from cache (dirty)
+    assertEquals("value", cache.get("key"));
+    
+    // Even before flush to DB
+    assertFalse(db.contains("key"));
+}
+```
+
+---
+
+# Real-Time Metrics Aggregator
+
+## Problem Introduction
+
+**Interviewer**: "Design a system that collects metrics from multiple threads and provides real-time aggregated statistics (count, sum, average, percentiles)."
+
+**Me**: "Great problem! Let me clarify:
+
+**Use Case**:
+```
+Web Server Metrics:
+- 1000s of requests/second
+- Each thread reports: latency, status code, size
+- Need real-time dashboard showing:
+  - Request count
+  - Average latency
+  - P50, P95, P99 latency
+  - Error rate
+  - Throughput
+
+Requirements:
+- Low overhead (don't slow down requests)
+- Thread-safe updates
+- Real-time queries
+```
+
+**Questions**:
+1. **Update frequency**: Millions per second?
+2. **Metrics types**: Counters, gauges, histograms?
+3. **Accuracy**: Exact or approximate OK?
+4. **Time windows**: Rolling windows or cumulative?
+5. **Percentiles**: Exact or approximate?
+
+**Assumptions**:
+- High frequency (100k+ updates/sec)
+- Counters, histograms, timers
+- Approximate OK for percentiles
+- Rolling 1-minute windows
+- Use efficient data structures
+
+Sound good?"
+
+**Interviewer**: "Yes, focus on efficient concurrent updates."
+
+---
+
+## High-Level Design
+
+**Me**: "Here's the approach:
+
+### Metric Types:
+```
+1. Counter: Simple increment (requests, errors)
+   → Use LongAdder (lock-free, high-contention optimized)
+
+2. Gauge: Current value (active connections)
+   → Use AtomicLong
+
+3. Histogram: Distribution (latency, size)
+   → Use HdrHistogram or approximate sketch
+
+4. Timer: Measure duration
+   → Histogram + Counter
+```
+
+### Key Design:
+```
+MetricsAggregator
+├── Counters (LongAdder)
+├── Gauges (AtomicLong)
+├── Histograms (ConcurrentHashMap<String, Histogram>)
+└── Time Windows (Sliding window)
+```
+
+### Lock-Free Optimization:
+Use `LongAdder` instead of `AtomicLong` for counters - much faster under contention!"
+
+---
+
+## Implementation
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class MetricsAggregator {
+    
+    // Counter: monotonically increasing
+    static class Counter {
+        private final LongAdder count = new LongAdder();
+        
+        void increment() {
+            count.increment();
+        }
+        
+        void add(long delta) {
+            count.add(delta);
+        }
+        
+        long get() {
+            return count.sum();
+        }
+        
+        void reset() {
+            count.reset();
+        }
+    }
+    
+    // Gauge: point-in-time value
+    static class Gauge {
+        private final AtomicLong value = new AtomicLong(0);
+        
+        void set(long newValue) {
+            value.set(newValue);
+        }
+        
+        void increment() {
+            value.incrementAndGet();
+        }
+        
+        void decrement() {
+            value.decrementAndGet();
+        }
+        
+        long get() {
+            return value.get();
+        }
+    }
+    
+    // Histogram: distribution of values
+    static class Histogram {
+        private final ConcurrentHashMap<Long, LongAdder> buckets;
+        private final LongAdder count;
+        private final LongAdder sum;
+        private final AtomicLong min;
+        private final AtomicLong max;
+        
+        Histogram() {
+            this.buckets = new ConcurrentHashMap<>();
+            this.count = new LongAdder();
+            this.sum = new LongAdder();
+            this.min = new AtomicLong(Long.MAX_VALUE);
+            this.max = new AtomicLong(Long.MIN_VALUE);
+        }
+        
+        void record(long value) {
+            // Update count and sum
+            count.increment();
+            sum.add(value);
+            
+            // Update min/max
+            updateMin(value);
+            updateMax(value);
+            
+            // Update histogram buckets (logarithmic)
+            long bucket = bucketFor(value);
+            buckets.computeIfAbsent(bucket, k -> new LongAdder()).increment();
+        }
+        
+        private void updateMin(long value) {
+            long current;
+            do {
+                current = min.get();
+                if (value >= current) return;
+            } while (!min.compareAndSet(current, value));
+        }
+        
+        private void updateMax(long value) {
+            long current;
+            do {
+                current = max.get();
+                if (value <= current) return;
+            } while (!max.compareAndSet(current, value));
+        }
+        
+        private long bucketFor(long value) {
+            // Logarithmic buckets: 0-1, 1-2, 2-4, 4-8, 8-16, ...
+            if (value <= 0) return 0;
+            return 1L << (63 - Long.numberOfLeadingZeros(value));
+        }
+        
+        HistogramSnapshot snapshot() {
+            return new HistogramSnapshot(
+                count.sum(),
+                sum.sum(),
+                min.get() == Long.MAX_VALUE ? 0 : min.get(),
+                max.get() == Long.MIN_VALUE ? 0 : max.get(),
+                new HashMap<>(buckets)  // Copy for thread safety
+            );
+        }
+    }
+    
+    static class HistogramSnapshot {
+        final long count;
+        final long sum;
+        final long min;
+        final long max;
+        final Map<Long, LongAdder> buckets;
+        
+        HistogramSnapshot(long count, long sum, long min, long max, 
+                         Map<Long, LongAdder> buckets) {
+            this.count = count;
+            this.sum = sum;
+            this.min = min;
+            this.max = max;
+            this.buckets = buckets;
+        }
+        
+        double mean() {
+            return count == 0 ? 0 : (double) sum / count;
+        }
+        
+        long percentile(double p) {
+            if (count == 0) return 0;
+            
+            long target = (long) (count * p / 100.0);
+            long cumulative = 0;
+            
+            // Sort buckets
+            List<Long> sortedBuckets = new ArrayList<>(buckets.keySet());
+            Collections.sort(sortedBuckets);
+            
+            for (Long bucket : sortedBuckets) {
+                cumulative += buckets.get(bucket).sum();
+                if (cumulative >= target) {
+                    return bucket;
+                }
+            }
+            
+            return max;
+        }
+        
+        @Override
+        public String toString() {
+            return String.format(
+                "count=%d, min=%d, max=%d, mean=%.2f, p50=%d, p95=%d, p99=%d",
+                count, min, max, mean(), 
+                percentile(50), percentile(95), percentile(99)
+            );
+        }
+    }
+    
+    // Main aggregator
+    private final ConcurrentHashMap<String, Counter> counters;
+    private final ConcurrentHashMap<String, Gauge> gauges;
+    private final ConcurrentHashMap<String, Histogram> histograms;
+    
+    public MetricsAggregator() {
+        this.counters = new ConcurrentHashMap<>();
+        this.gauges = new ConcurrentHashMap<>();
+        this.histograms = new ConcurrentHashMap<>();
+    }
+    
+    // Counter operations
+    public void incrementCounter(String name) {
+        counters.computeIfAbsent(name, k -> new Counter()).increment();
+    }
+    
+    public void addToCounter(String name, long delta) {
+        counters.computeIfAbsent(name, k -> new Counter()).add(delta);
+    }
+    
+    public long getCounter(String name) {
+        Counter counter = counters.get(name);
+        return counter != null ? counter.get() : 0;
+    }
+    
+    // Gauge operations
+    public void setGauge(String name, long value) {
+        gauges.computeIfAbsent(name, k -> new Gauge()).set(value);
+    }
+    
+    public void incrementGauge(String name) {
+        gauges.computeIfAbsent(name, k -> new Gauge()).increment();
+    }
+    
+    public void decrementGauge(String name) {
+        gauges.computeIfAbsent(name, k -> new Gauge()).decrement();
+    }
+    
+    public long getGauge(String name) {
+        Gauge gauge = gauges.get(name);
+        return gauge != null ? gauge.get() : 0;
+    }
+    
+    // Histogram operations
+    public void recordValue(String name, long value) {
+        histograms.computeIfAbsent(name, k -> new Histogram()).record(value);
+    }
+    
+    public HistogramSnapshot getHistogram(String name) {
+        Histogram histogram = histograms.get(name);
+        return histogram != null ? histogram.snapshot() : 
+            new HistogramSnapshot(0, 0, 0, 0, Collections.emptyMap());
+    }
+    
+    // Timer helper
+    public TimerContext startTimer(String name) {
+        return new TimerContext(this, name);
+    }
+    
+    static class TimerContext implements AutoCloseable {
+        private final MetricsAggregator aggregator;
+        private final String name;
+        private final long startTime;
+        
+        TimerContext(MetricsAggregator aggregator, String name) {
+            this.aggregator = aggregator;
+            this.name = name;
+            this.startTime = System.nanoTime();
+        }
+        
+        @Override
+        public void close() {
+            long durationNs = System.nanoTime() - startTime;
+            long durationMs = durationNs / 1_000_000;
+            aggregator.recordValue(name, durationMs);
+        }
+    }
+    
+    // Get all metrics
+    public Map<String, Object> getAllMetrics() {
+        Map<String, Object> metrics = new HashMap<>();
+        
+        Map<String, Long> counterValues = new HashMap<>();
+        counters.forEach((name, counter) -> counterValues.put(name, counter.get()));
+        metrics.put("counters", counterValues);
+        
+        Map<String, Long> gaugeValues = new HashMap<>();
+        gauges.forEach((name, gauge) -> gaugeValues.put(name, gauge.get()));
+        metrics.put("gauges", gaugeValues);
+        
+        Map<String, String> histogramValues = new HashMap<>();
+        histograms.forEach((name, histogram) -> 
+            histogramValues.put(name, histogram.snapshot().toString()));
+        metrics.put("histograms", histogramValues);
+        
+        return metrics;
+    }
+    
+    // Test
+    public static void main(String[] args) throws InterruptedException {
+        MetricsAggregator metrics = new MetricsAggregator();
+        
+        System.out.println("=== Simulating Web Server Metrics ===\n");
+        
+        // Simulate multiple threads handling requests
+        ExecutorService executor = Executors.newFixedThreadPool(10);
+        CountDownLatch latch = new CountDownLatch(10);
+        
+        for (int i = 0; i < 10; i++) {
+            executor.submit(() -> {
+                try {
+                    for (int j = 0; j < 1000; j++) {
+                        // Increment request counter
+                        metrics.incrementCounter("requests");
+                        
+                        // Update active connections gauge
+                        metrics.incrementGauge("activeConnections");
+                        
+                        // Measure request latency
+                        try (TimerContext timer = metrics.startTimer("requestLatency")) {
+                            // Simulate request processing
+                            int latency = 10 + (int) (Math.random() * 100);
+                            Thread.sleep(latency);
+                        }
+                        
+                        // Record response size
+                        long size = 1000 + (long) (Math.random() * 10000);
+                        metrics.recordValue("responseSize", size);
+                        
+                        // Random errors
+                        if (Math.random() < 0.05) {
+                            metrics.incrementCounter("errors");
+                        }
+                        
+                        metrics.decrementGauge("activeConnections");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+        
+        // Print metrics periodically
+        for (int i = 0; i < 5; i++) {
+            Thread.sleep(2000);
+            System.out.println("\n=== Metrics Snapshot (t=" + (i * 2) + "s) ===");
+            System.out.println("Requests: " + metrics.getCounter("requests"));
+            System.out.println("Errors: " + metrics.getCounter("errors"));
+            System.out.println("Active Connections: " + metrics.getGauge("activeConnections"));
+            System.out.println("Request Latency: " + metrics.getHistogram("requestLatency"));
+            System.out.println("Response Size: " + metrics.getHistogram("responseSize"));
+        }
+        
+        latch.await();
+        executor.shutdown();
+        
+        System.out.println("\n=== Final Metrics ===");
+        metrics.getAllMetrics().forEach((key, value) -> {
+            System.out.println(key + ": " + value);
+        });
+    }
+}
+```
+
+---
+
+## Why LongAdder vs AtomicLong?
+
+**Me**: "Let me explain the performance difference:
+
+### AtomicLong (CAS on single variable)
+
+```java
+class AtomicLong {
+    private volatile long value;
+    
+    long incrementAndGet() {
+        while (true) {
+            long current = value;
+            long next = current + 1;
+            if (compareAndSet(current, next)) {
+                return next;
+            }
+            // Retry on contention
+        }
+    }
+}
+
+// Under high contention (16 threads):
+Thread-1: CAS → success
+Thread-2: CAS → fail → retry
+Thread-3: CAS → fail → retry
+Thread-4: CAS → fail → retry
+...
+Many retries!
+```
+
+### LongAdder (Striped counters)
+
+```java
+class LongAdder {
+    // Multiple cells, threads update different cells
+    private Cell[] cells;
+    private volatile long base;
+    
+    void increment() {
+        int probe = Thread.currentThread().threadLocalRandomProbe();
+        Cell cell = cells[probe % cells.length];
+        cell.add(1);  // Less contention per cell!
+    }
+    
+    long sum() {
+        long total = base;
+        for (Cell cell : cells) {
+            total += cell.value;
+        }
+        return total;
+    }
+}
+
+// Under high contention (16 threads, 4 cells):
+Thread-1: Update cell-0 ✓
+Thread-2: Update cell-1 ✓ (different cell!)
+Thread-3: Update cell-2 ✓
+Thread-4: Update cell-3 ✓
+Thread-5: Update cell-0 (small contention)
+...
+Much less contention!
+```
+
+### Performance Comparison
+
+```java
+// Benchmark
+public class LongAdderVsAtomicLong {
+    public static void main(String[] args) throws InterruptedException {
+        int threads = 32;
+        int iterations = 1_000_000;
+        
+        // AtomicLong
+        AtomicLong atomicCounter = new AtomicLong();
+        long start = System.nanoTime();
+        runTest(threads, iterations, atomicCounter::incrementAndGet);
+        long atomicTime = System.nanoTime() - start;
+        
+        // LongAdder
+        LongAdder adderCounter = new LongAdder();
+        start = System.nanoTime();
+        runTest(threads, iterations, adderCounter::increment);
+        long adderTime = System.nanoTime() - start;
+        
+        System.out.println("AtomicLong: " + atomicTime / 1_000_000 + " ms");
+        System.out.println("LongAdder:  " + adderTime / 1_000_000 + " ms");
+        System.out.println("Speedup:    " + (double)atomicTime / adderTime + "x");
+    }
+}
+
+// Typical results:
+// AtomicLong: 2500 ms
+// LongAdder:  450 ms
+// Speedup: 5.5x
+```
+
+**When to use each**:
+- **AtomicLong**: Low contention, need exact value frequently
+- **LongAdder**: High contention (8+ threads), infrequent reads
+"
+
+---
+
+## Advanced: Sliding Time Windows
+
+**Me**: "For time-based metrics:
+
+```java
+public class SlidingWindowCounter {
+    private static final int WINDOW_SIZE_MS = 60_000;  // 1 minute
+    private static final int BUCKET_SIZE_MS = 1_000;   // 1 second
+    private static final int NUM_BUCKETS = WINDOW_SIZE_MS / BUCKET_SIZE_MS;
+    
+    static class TimeBucket {
+        final long timestamp;
+        final LongAdder count;
+        
+        TimeBucket(long timestamp) {
+            this.timestamp = timestamp;
+            this.count = new LongAdder();
+        }
+    }
+    
+    private final TimeBucket[] buckets = new TimeBucket[NUM_BUCKETS];
+    private final AtomicInteger currentIndex = new AtomicInteger(0);
+    
+    public SlidingWindowCounter() {
+        long now = System.currentTimeMillis();
+        for (int i = 0; i < NUM_BUCKETS; i++) {
+            buckets[i] = new TimeBucket(now - (NUM_BUCKETS - i) * BUCKET_SIZE_MS);
+        }
+    }
+    
+    public void increment() {
+        long now = System.currentTimeMillis();
+        int index = (int) ((now / BUCKET_SIZE_MS) % NUM_BUCKETS);
+        
+        TimeBucket bucket = buckets[index];
+        
+        // Check if bucket is stale
+        if (now - bucket.timestamp >= WINDOW_SIZE_MS) {
+            // Reset bucket
+            synchronized (bucket) {
+                if (now - bucket.timestamp >= WINDOW_SIZE_MS) {
+                    bucket.count.reset();
+                    buckets[index] = new TimeBucket(now);
+                }
+            }
+        }
+        
+        buckets[index].count.increment();
+    }
+    
+    public long getCount() {
+        long now = System.currentTimeMillis();
+        long total = 0;
+        
+        for (TimeBucket bucket : buckets) {
+            if (now - bucket.timestamp < WINDOW_SIZE_MS) {
+                total += bucket.count.sum();
+            }
+        }
+        
+        return total;
+    }
+    
+    public double getRate() {
+        return getCount() / (WINDOW_SIZE_MS / 1000.0);  // per second
+    }
+}
+```
+
+**Benefits**:
+- Get rate over last N seconds
+- Automatically expires old data
+- Lock-free increments (LongAdder per bucket)
+"
+
