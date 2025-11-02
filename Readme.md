@@ -6049,4 +6049,1363 @@ public void testLRU() {
 }
 ```
 
+# Rate Limiter
+
+## Problem Introduction
+
+**Interviewer**: "Design a rate limiter that allows N requests per time window. It should be thread-safe and handle concurrent requests."
+
+**Me**: "Great! Let me clarify the requirements:
+
+**Scenarios**:
+```
+Rate: 10 requests per second
+
+Scenario 1: Fixed Window
+Second 1: 10 requests → all allowed
+Second 2: 10 requests → all allowed
+Second 1 (11th request) → DENIED
+
+Scenario 2: Sliding Window
+Time 0.5s: 10 requests
+Time 1.5s: Request #11 → Check last 1 second → 10 requests in window → DENIED
+
+Scenario 3: Token Bucket
+Start with 10 tokens
+Request consumes 1 token
+Tokens refill at 10/second
+```
+
+**Questions**:
+1. **Algorithm**: Fixed window, sliding window, or token bucket?
+2. **Scope**: Per-user, per-IP, or global?
+3. **Distributed**: Single machine or distributed?
+4. **Blocking**: Block when limit reached or reject immediately?
+5. **Burst handling**: Allow bursts or strict rate?
+
+**Assumptions**:
+- Token bucket (allows bursts, smooth refill)
+- Per-key rate limiting
+- Single machine
+- Reject immediately (non-blocking)
+- Configurable rate
+
+Sound good?"
+
+**Interviewer**: "Yes, start with token bucket approach."
+
+---
+
+## High-Level Design
+
+**Me**: "Here's the token bucket algorithm:
+
+### Concept:
+```
+Bucket capacity: 10 tokens
+Refill rate: 10 tokens/second (1 token per 100ms)
+
+Request arrives:
+1. Refill tokens based on time elapsed
+2. If tokens >= 1: Allow request, consume 1 token
+3. If tokens < 1: Deny request
+
+Timeline:
+T=0:    10 tokens, request → 9 tokens (allowed)
+T=100:  10 tokens (refilled), request → 9 tokens (allowed)
+T=0:    10 rapid requests → 0 tokens
+T=50:   Request → 0 tokens (denied - not enough time to refill)
+T=100:  1 token refilled, request → 0 tokens (allowed)
+```
+
+### Key Components:
+```
+RateLimiter
+├── AtomicInteger tokens (current available)
+├── AtomicLong lastRefillTime
+├── maxTokens (capacity)
+├── refillRate (tokens per second)
+└── Per-key limiters (Map)
+```
+
+### Lock-Free Design:
+Use `AtomicInteger` for tokens - perfect use case for CAS!"
+
+---
+
+## Implementation: Single Rate Limiter
+
+```java
+import java.util.concurrent.atomic.*;
+
+public class TokenBucketRateLimiter {
+    
+    private final int maxTokens;
+    private final double refillRate;  // tokens per second
+    private final AtomicInteger tokens;
+    private final AtomicLong lastRefillTime;
+    
+    // Statistics
+    private final AtomicLong allowed = new AtomicLong(0);
+    private final AtomicLong denied = new AtomicLong(0);
+    
+    public TokenBucketRateLimiter(int maxTokens, double refillRate) {
+        if (maxTokens <= 0 || refillRate <= 0) {
+            throw new IllegalArgumentException("maxTokens and refillRate must be positive");
+        }
+        
+        this.maxTokens = maxTokens;
+        this.refillRate = refillRate;
+        this.tokens = new AtomicInteger(maxTokens);
+        this.lastRefillTime = new AtomicLong(System.currentTimeMillis());
+    }
+    
+    public boolean tryAcquire() {
+        return tryAcquire(1);
+    }
+    
+    public boolean tryAcquire(int permits) {
+        if (permits <= 0) {
+            throw new IllegalArgumentException("Permits must be positive");
+        }
+        
+        // Refill tokens based on elapsed time
+        refillTokens();
+        
+        // Try to consume tokens using CAS
+        while (true) {
+            int currentTokens = tokens.get();
+            
+            if (currentTokens < permits) {
+                // Not enough tokens
+                denied.incrementAndGet();
+                System.out.println(Thread.currentThread().getName() + 
+                    " - DENIED (tokens: " + currentTokens + ")");
+                return false;
+            }
+            
+            int newTokens = currentTokens - permits;
+            
+            // CAS: only succeed if tokens hasn't changed
+            if (tokens.compareAndSet(currentTokens, newTokens)) {
+                allowed.incrementAndGet();
+                System.out.println(Thread.currentThread().getName() + 
+                    " - ALLOWED (tokens: " + currentTokens + " -> " + newTokens + ")");
+                return true;
+            }
+            
+            // CAS failed, retry
+        }
+    }
+    
+    private void refillTokens() {
+        long now = System.currentTimeMillis();
+        long lastRefill = lastRefillTime.get();
+        long elapsedMs = now - lastRefill;
+        
+        if (elapsedMs > 0) {
+            // Calculate tokens to add
+            double tokensToAdd = (elapsedMs / 1000.0) * refillRate;
+            int tokensToAddInt = (int) tokensToAdd;
+            
+            if (tokensToAddInt > 0) {
+                // Try to update last refill time
+                if (lastRefillTime.compareAndSet(lastRefill, now)) {
+                    // Successfully updated time, now add tokens
+                    while (true) {
+                        int currentTokens = tokens.get();
+                        int newTokens = Math.min(maxTokens, currentTokens + tokensToAddInt);
+                        
+                        if (tokens.compareAndSet(currentTokens, newTokens)) {
+                            if (newTokens > currentTokens) {
+                                System.out.println("Refilled: " + tokensToAddInt + 
+                                    " tokens (" + currentTokens + " -> " + newTokens + ")");
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    public int getAvailableTokens() {
+        refillTokens();
+        return tokens.get();
+    }
+    
+    public Map<String, Long> getStatistics() {
+        Map<String, Long> stats = new HashMap<>();
+        stats.put("allowed", allowed.get());
+        stats.put("denied", denied.get());
+        stats.put("availableTokens", (long) getAvailableTokens());
+        
+        long total = allowed.get() + denied.get();
+        stats.put("allowRate", total == 0 ? 0 : (allowed.get() * 100 / total));
+        
+        return stats;
+    }
+    
+    // Test
+    public static void main(String[] args) throws InterruptedException {
+        TokenBucketRateLimiter limiter = new TokenBucketRateLimiter(5, 2.0);  // 5 tokens, 2/sec
+        
+        System.out.println("=== Burst Test ===");
+        // Burst: should allow 5, then deny
+        for (int i = 0; i < 8; i++) {
+            limiter.tryAcquire();
+        }
+        
+        System.out.println("\n=== Refill Test ===");
+        Thread.sleep(1000);  // Wait 1 second for refill (2 tokens)
+        
+        for (int i = 0; i < 4; i++) {
+            limiter.tryAcquire();
+        }
+        
+        System.out.println("\n=== Statistics ===");
+        limiter.getStatistics().forEach((key, value) -> 
+            System.out.println(key + ": " + value));
+    }
+}
+```
+
+---
+
+## Implementation: Per-Key Rate Limiter
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class MultiKeyRateLimiter<K> {
+    
+    private final ConcurrentHashMap<K, TokenBucketRateLimiter> limiters;
+    private final int maxTokens;
+    private final double refillRate;
+    
+    // Cleanup old limiters
+    private final ScheduledExecutorService cleaner;
+    private final long limiterTtlMs;
+    private final ConcurrentHashMap<K, Long> lastAccessTime;
+    
+    public MultiKeyRateLimiter(int maxTokens, double refillRate, long limiterTtlMs) {
+        this.maxTokens = maxTokens;
+        this.refillRate = refillRate;
+        this.limiterTtlMs = limiterTtlMs;
+        
+        this.limiters = new ConcurrentHashMap<>();
+        this.lastAccessTime = new ConcurrentHashMap<>();
+        
+        // Periodic cleanup of unused limiters
+        this.cleaner = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "LimiterCleaner");
+            t.setDaemon(true);
+            return t;
+        });
+        
+        cleaner.scheduleAtFixedRate(
+            this::cleanupUnusedLimiters,
+            60000,  // Initial delay: 1 minute
+            60000,  // Period: 1 minute
+            TimeUnit.MILLISECONDS
+        );
+    }
+    
+    public boolean tryAcquire(K key) {
+        // Get or create limiter for this key
+        TokenBucketRateLimiter limiter = limiters.computeIfAbsent(
+            key,
+            k -> new TokenBucketRateLimiter(maxTokens, refillRate)
+        );
+        
+        // Update last access time
+        lastAccessTime.put(key, System.currentTimeMillis());
+        
+        return limiter.tryAcquire();
+    }
+    
+    public boolean tryAcquire(K key, int permits) {
+        TokenBucketRateLimiter limiter = limiters.computeIfAbsent(
+            key,
+            k -> new TokenBucketRateLimiter(maxTokens, refillRate)
+        );
+        
+        lastAccessTime.put(key, System.currentTimeMillis());
+        
+        return limiter.tryAcquire(permits);
+    }
+    
+    private void cleanupUnusedLimiters() {
+        long now = System.currentTimeMillis();
+        int cleaned = 0;
+        
+        Iterator<Map.Entry<K, Long>> iterator = lastAccessTime.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<K, Long> entry = iterator.next();
+            
+            if (now - entry.getValue() > limiterTtlMs) {
+                K key = entry.getKey();
+                limiters.remove(key);
+                iterator.remove();
+                cleaned++;
+            }
+        }
+        
+        if (cleaned > 0) {
+            System.out.println("Cleaned up " + cleaned + " unused limiters");
+        }
+    }
+    
+    public int getActiveLimiters() {
+        return limiters.size();
+    }
+    
+    public Map<String, Long> getStatistics(K key) {
+        TokenBucketRateLimiter limiter = limiters.get(key);
+        return limiter != null ? limiter.getStatistics() : Collections.emptyMap();
+    }
+    
+    public void shutdown() {
+        cleaner.shutdown();
+    }
+    
+    // Test
+    public static void main(String[] args) throws InterruptedException {
+        MultiKeyRateLimiter<String> limiter = new MultiKeyRateLimiter<>(
+            3,      // 3 tokens
+            1.0,    // 1 token/second refill
+            60000   // 1 minute TTL
+        );
+        
+        System.out.println("=== Per-User Rate Limiting ===");
+        
+        // User 1: burst
+        System.out.println("\nUser1 burst:");
+        for (int i = 0; i < 5; i++) {
+            limiter.tryAcquire("user1");
+        }
+        
+        // User 2: different limit
+        System.out.println("\nUser2 burst:");
+        for (int i = 0; i < 5; i++) {
+            limiter.tryAcquire("user2");
+        }
+        
+        Thread.sleep(2000);  // Wait for refill
+        
+        System.out.println("\nAfter 2 seconds:");
+        limiter.tryAcquire("user1");
+        limiter.tryAcquire("user2");
+        
+        System.out.println("\n=== Statistics ===");
+        System.out.println("Active limiters: " + limiter.getActiveLimiters());
+        System.out.println("User1: " + limiter.getStatistics("user1"));
+        System.out.println("User2: " + limiter.getStatistics("user2"));
+        
+        limiter.shutdown();
+    }
+}
+```
+
+---
+
+## Pitfalls and Edge Cases
+
+**Me**: "Key gotchas:
+
+### Pitfall 1: Race Condition in Refill
+
+```java
+// ❌ WRONG - Race condition
+private void refillTokens() {
+    long now = System.currentTimeMillis();
+    long elapsed = now - lastRefillTime.get();
+    
+    if (elapsed > 0) {
+        int tokensToAdd = (int) ((elapsed / 1000.0) * refillRate);
+        
+        // Two threads can both see elapsed > 0
+        // Both add tokens!
+        tokens.addAndGet(tokensToAdd);
+        lastRefillTime.set(now);
+    }
+}
+
+// ✓ CORRECT - CAS on lastRefillTime
+private void refillTokens() {
+    long now = System.currentTimeMillis();
+    long lastRefill = lastRefillTime.get();
+    long elapsed = now - lastRefill;
+    
+    if (elapsed > 0) {
+        int tokensToAdd = (int) ((elapsed / 1000.0) * refillRate);
+        
+        // Only one thread succeeds in updating time
+        if (lastRefillTime.compareAndSet(lastRefill, now)) {
+            // Only this thread adds tokens
+            while (true) {
+                int current = tokens.get();
+                int newTokens = Math.min(maxTokens, current + tokensToAdd);
+                if (tokens.compareAndSet(current, newTokens)) {
+                    break;
+                }
+            }
+        }
+    }
+}
+```
+
+### Pitfall 2: Integer Overflow
+
+```java
+// ❌ WRONG - Can overflow with large elapsed time
+long elapsedMs = now - lastRefillTime;  // Could be days!
+int tokensToAdd = (int) ((elapsedMs / 1000.0) * refillRate);
+// tokensToAdd could overflow int!
+
+// ✓ CORRECT - Cap at maxTokens
+int tokensToAdd = (int) Math.min(
+    maxTokens,
+    (elapsedMs / 1000.0) * refillRate
+);
+```
+
+### Pitfall 3: Thundering Herd on Refill
+
+```java
+// Problem: All threads call refillTokens() on every request
+// Wasteful if recently refilled
+
+// Solution: Check if refill is needed before CAS
+private void refillTokens() {
+    long now = System.currentTimeMillis();
+    long lastRefill = lastRefillTime.get();
+    long elapsed = now - lastRefill;
+    
+    // Early exit if recently refilled
+    if (elapsed < 100) {  // Less than 100ms
+        return;  // Don't bother
+    }
+    
+    // Proceed with refill...
+}
+```
+
+### Pitfall 4: Precision Loss with Double
+
+```java
+// ❌ WRONG - Precision issues
+double tokensToAdd = (elapsedMs / 1000.0) * refillRate;
+int tokensInt = (int) tokensToAdd;  // Loses fractional tokens!
+
+// Better: Track fractional tokens
+private final AtomicReference<Double> fractionalTokens = new AtomicReference<>(0.0);
+
+double tokensToAdd = (elapsedMs / 1000.0) * refillRate;
+double withFractional = tokensToAdd + fractionalTokens.get();
+int tokensInt = (int) withFractional;
+fractionalTokens.set(withFractional - tokensInt);
+```
+
+### Pitfall 5: Memory Leak with Per-Key Limiters
+
+```java
+// ❌ WRONG - Limiters accumulate forever
+ConcurrentHashMap<K, RateLimiter> limiters = new ConcurrentHashMap<>();
+
+public boolean tryAcquire(K key) {
+    RateLimiter limiter = limiters.computeIfAbsent(key, k -> new RateLimiter(...));
+    return limiter.tryAcquire();
+}
+// Keys never removed, even for inactive users!
+
+// ✓ CORRECT - Periodic cleanup (shown in MultiKeyRateLimiter)
+private void cleanupUnusedLimiters() {
+    // Remove limiters not accessed in last N minutes
+}
+```
+
+### Pitfall 6: Distributed Rate Limiting
+
+```java
+// Problem: Multiple servers each have their own limiters
+// User can exceed rate by hitting different servers!
+
+// Solution: Use shared storage (Redis)
+public class DistributedRateLimiter {
+    private final Jedis redis;
+    
+    public boolean tryAcquire(String key) {
+        String redisKey = "ratelimit:" + key;
+        
+        // Lua script for atomic get-and-decrement
+        String script = 
+            "local tokens = redis.call('get', KEYS[1]) " +
+            "if not tokens then " +
+            "  redis.call('set', KEYS[1], ARGV[1]) " +
+            "  redis.call('expire', KEYS[1], ARGV[2]) " +
+            "  return 1 " +
+            "end " +
+            "if tonumber(tokens) > 0 then " +
+            "  redis.call('decr', KEYS[1]) " +
+            "  return 1 " +
+            "else " +
+            "  return 0 " +
+            "end";
+        
+        Object result = redis.eval(script, 
+            Collections.singletonList(redisKey),
+            Arrays.asList(String.valueOf(maxTokens), "60"));
+        
+        return "1".equals(result.toString());
+    }
+}
+```
+"
+
+---
+
+## Alternative Algorithms
+
+**Me**: "Other rate limiting algorithms:
+
+### Fixed Window Counter
+
+```java
+public class FixedWindowRateLimiter {
+    private final int maxRequests;
+    private final long windowMs;
+    private final AtomicInteger counter;
+    private final AtomicLong windowStart;
+    
+    public boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        long currentWindowStart = windowStart.get();
+        
+        // Check if we're in a new window
+        if (now - currentWindowStart >= windowMs) {
+            if (windowStart.compareAndSet(currentWindowStart, now)) {
+                counter.set(0);
+            }
+        }
+        
+        // Try to increment counter
+        while (true) {
+            int current = counter.get();
+            if (current >= maxRequests) {
+                return false;  // Rate limited
+            }
+            if (counter.compareAndSet(current, current + 1)) {
+                return true;
+            }
+        }
+    }
+}
+```
+
+**Problem**: Burst at window boundary!
+```
+Window 1 (0-1s): 100 requests at t=0.9s (allowed)
+Window 2 (1-2s): 100 requests at t=1.0s (allowed)
+Result: 200 requests in 0.1 seconds!
+```
+
+### Sliding Window Log
+
+```java
+public class SlidingWindowLogRateLimiter {
+    private final int maxRequests;
+    private final long windowMs;
+    private final ConcurrentLinkedQueue<Long> requestLog;
+    
+    public boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        long windowStart = now - windowMs;
+        
+        // Remove old requests
+        while (!requestLog.isEmpty() && requestLog.peek() < windowStart) {
+            requestLog.poll();
+        }
+        
+        if (requestLog.size() < maxRequests) {
+            requestLog.offer(now);
+            return true;
+        }
+        
+        return false;
+    }
+}
+```
+
+**Problem**: Memory overhead (stores all requests)
+
+### Sliding Window Counter (Hybrid)
+
+```java
+public class SlidingWindowCounterRateLimiter {
+    private final int maxRequests;
+    private final long windowMs;
+    private final AtomicInteger currentCount;
+    private final AtomicInteger previousCount;
+    private final AtomicLong currentWindowStart;
+    
+    public boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        long currentStart = currentWindowStart.get();
+        
+        // Slide window if needed
+        if (now - currentStart >= windowMs) {
+            if (currentWindowStart.compareAndSet(currentStart, now)) {
+                previousCount.set(currentCount.get());
+                currentCount.set(0);
+            }
+        }
+        
+        // Calculate weighted count
+        long elapsed = now - currentWindowStart.get();
+        double weight = 1.0 - (elapsed / (double) windowMs);
+        double estimatedCount = previousCount.get() * weight + currentCount.get();
+        
+        if (estimatedCount < maxRequests) {
+            currentCount.incrementAndGet();
+            return true;
+        }
+        
+        return false;
+    }
+}
+```
+
+**Comparison**:
+
+| Algorithm | Pros | Cons | Use Case |
+|-----------|------|------|----------|
+| **Token Bucket** | Smooth, allows bursts | Complex refill logic | General purpose, API throttling |
+| **Fixed Window** | Simple, memory efficient | Burst at boundaries | Low precision OK |
+| **Sliding Log** | Precise | High memory | Need exact limits |
+| **Sliding Counter** | Good precision, low memory | Approximation | Balance precision/memory |
+"
+
+---
+
+## Interview Follow-Up Questions
+
+**Q1: How to handle distributed rate limiting across multiple servers?**
+
+```java
+// Option 1: Redis with Lua script (atomic)
+public class RedisRateLimiter {
+    private final Jedis redis;
+    
+    public boolean tryAcquire(String key) {
+        String script = 
+            "local current = redis.call('incr', KEYS[1]) " +
+            "if current == 1 then " +
+            "  redis.call('expire', KEYS[1], ARGV[1]) " +
+            "end " +
+            "if current > tonumber(ARGV[2]) then " +
+            "  return 0 " +
+            "else " +
+            "  return 1 " +
+            "end";
+        
+        Object result = redis.eval(script,
+            Collections.singletonList("ratelimit:" + key),
+            Arrays.asList("60", "100"));  // 60s window, 100 requests
+        
+        return "1".equals(result.toString());
+    }
+}
+
+// Option 2: Consensus-based (more complex)
+// Use distributed counter with eventual consistency
+```
+
+**Q2: How to implement priority-based rate limiting?**
+
+```java
+public class PriorityRateLimiter {
+    private final TokenBucketRateLimiter highPriority;
+    private final TokenBucketRateLimiter lowPriority;
+    
+    public boolean tryAcquire(int priority) {
+        if (priority == HIGH) {
+            // Try high priority first, fallback to low
+            return highPriority.tryAcquire() || lowPriority.tryAcquire();
+        } else {
+            // Low priority only uses its bucket
+            return lowPriority.tryAcquire();
+        }
+    }
+}
+```
+
+**Q3: How to test rate limiter?**
+
+```java
+@Test
+public void testRateLimit() throws InterruptedException {
+    RateLimiter limiter = new TokenBucketRateLimiter(10, 10.0);
+    
+    // Burst: should allow 10
+    int allowed = 0;
+    for (int i = 0; i < 15; i++) {
+        if (limiter.tryAcquire()) {
+            allowed++;
+        }
+    }
+    assertEquals(10, allowed);
+    
+    // Wait for refill
+    Thread.sleep(1000);
+    
+    // Should allow ~10 more
+    allowed = 0;
+    for (int i = 0; i < 15; i++) {
+        if (limiter.tryAcquire()) {
+            allowed++;
+        }
+    }
+    assertTrue(allowed >= 9 && allowed <= 11);  // Allow some variance
+}
+```
+
+---
+
+# Multi-Stage Pipeline with Backpressure
+
+## Problem Introduction
+
+**Interviewer**: "Design a multi-stage processing pipeline where data flows through multiple stages. Handle backpressure when downstream stages are slow."
+
+**Me**: "Great problem! Let me clarify:
+
+**Scenario**:
+```
+Stage 1 (Fast)    Stage 2 (Medium)   Stage 3 (Slow)
+Download     →    Parse          →    Store
+100 items/s       50 items/s          10 items/s
+
+Problem: Stage 1 overwhelms Stage 2, Stage 2 overwhelms Stage 3
+Solution: Backpressure - slow down upstream when downstream is full
+```
+
+**Questions**:
+1. **Pipeline structure**: Linear or DAG?
+2. **Backpressure strategy**: Block, drop, or buffer?
+3. **Queue bounds**: Fixed or unbounded?
+4. **Failure handling**: Retry, dead letter, or fail fast?
+5. **Ordering**: Must preserve order?
+
+**Assumptions**:
+- Linear pipeline (Stage 1 → 2 → 3)
+- Block upstream (backpressure)
+- Bounded queues between stages
+- Simple error logging
+- Order preserved
+
+Sound good?"
+
+**Interviewer**: "Yes, focus on backpressure mechanism."
+
+---
+
+## High-Level Design
+
+**Me**: "Here's the architecture:
+
+### Pipeline Structure:
+```
+┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
+│ Stage 1 │───▶│ Queue 1 │───▶│ Stage 2 │───▶│ Queue 2 │───▶│ Stage 3 │
+│  Fast   │    │(bounded)│    │ Medium  │    │(bounded)│    │  Slow   │
+└─────────┘    └─────────┘    └─────────┘    └─────────┘    └─────────┘
+                    ▲                              ▲
+                    │                              │
+                Blocks when full              Blocks when full
+```
+
+### Backpressure Flow:
+```
+1. Stage 3 is slow → Queue 2 fills up
+2. Stage 2 tries to put → Queue 2 blocks Stage 2
+3. Queue 1 fills up (Stage 2 not consuming)
+4. Stage 1 tries to put → Queue 1 blocks Stage 1
+5. Stage 1 slows down → Backpressure propagated!
+```
+
+### Key Design:
+- Use `BlockingQueue` (built-in blocking)
+- Each stage is a thread pool
+- Bounded queues create backpressure naturally"
+
+---
+
+## Implementation
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.function.*;
+
+public class Pipeline<T> {
+    
+    private final List<Stage<?, ?>> stages;
+    private volatile boolean shutdown = false;
+    
+    // Statistics
+    private final AtomicLong itemsProcessed = new AtomicLong(0);
+    private final AtomicLong itemsFailed = new AtomicLong(0);
+    
+    private Pipeline(List<Stage<?, ?>> stages) {
+        this.stages = stages;
+    }
+    
+    public static <T> PipelineBuilder<T> builder() {
+        return new PipelineBuilder<>();
+    }
+    
+    public void start() {
+        for (Stage<?, ?> stage : stages) {
+            stage.start();
+        }
+        System.out.println("Pipeline started with " + stages.size() + " stages");
+    }
+    
+    public void shutdown() throws InterruptedException {
+        shutdown = true;
+        
+        for (Stage<?, ?> stage : stages) {
+            stage.shutdown();
+        }
+        
+        System.out.println("Pipeline shut down");
+    }
+    
+    public void submit(T item) throws InterruptedException {
+        if (shutdown) {
+            throw new IllegalStateException("Pipeline is shut down");
+        }
+        
+        @SuppressWarnings("unchecked")
+        Stage<T, ?> firstStage = (Stage<T, ?>) stages.get(0);
+        firstStage.submit(item);
+    }
+    
+    public Map<String, Object> getStatistics() {
+        Map<String, Object> stats = new HashMap<>();
+        stats.put("itemsProcessed", itemsProcessed.get());
+        stats.put("itemsFailed", itemsFailed.get());
+        
+        List<Map<String, Object>> stageStats = new ArrayList<>();
+        for (Stage<?, ?> stage : stages) {
+            stageStats.add(stage.getStatistics());
+        }
+        stats.put("stages", stageStats);
+        
+        return stats;
+    }
+    
+    // Individual stage
+    static class Stage<I, O> {
+        private final String name;
+        private final Function<I, O> processor;
+        private final BlockingQueue<I> inputQueue;
+        private final BlockingQueue<O> outputQueue;
+        private final ExecutorService workers;
+        private final int numWorkers;
+        
+        // Statistics
+        private final AtomicLong processed = new AtomicLong(0);
+        private final AtomicLong failed = new AtomicLong(0);
+        private volatile boolean shutdown = false;
+        
+        public Stage(String name, 
+                     int queueSize, 
+                     int numWorkers,
+                     Function<I, O> processor,
+                     BlockingQueue<O> outputQueue) {
+            this.name = name;
+            this.processor = processor;
+            this.inputQueue = new ArrayBlockingQueue<>(queueSize);
+            this.outputQueue = outputQueue;
+            this.numWorkers = numWorkers;
+            this.workers = Executors.newFixedThreadPool(numWorkers);
+        }
+        
+        public void start() {
+            for (int i = 0; i < numWorkers; i++) {
+                final int workerId = i;
+                workers.submit(() -> processLoop(workerId));
+            }
+            System.out.println(name + " started with " + numWorkers + " workers");
+        }
+        
+        private void processLoop(int workerId) {
+            while (!shutdown) {
+                try {
+                    // Take from input queue (blocks if empty)
+                    I item = inputQueue.poll(100, TimeUnit.MILLISECONDS);
+                    if (item == null) {
+                        continue;  // Timeout, check shutdown flag
+                    }
+                    
+                    System.out.println(name + "-Worker-" + workerId + 
+                        " processing item (queue size: " + inputQueue.size() + ")");
+                    
+                    // Process item
+                    O result = processor.apply(item);
+                    processed.incrementAndGet();
+                    
+                    // Put to output queue (blocks if full - BACKPRESSURE!)
+                    if (outputQueue != null) {
+                        outputQueue.put(result);
+                        System.out.println(name + "-Worker-" + workerId + 
+                            " sent to next stage (output queue size: " + outputQueue.size() + ")");
+                    }
+                    
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    System.err.println(name + " error: " + e.getMessage());
+                    failed.incrementAndGet();
+                }
+            }
+        }
+        
+        public void submit(I item) throws InterruptedException {
+            // Blocks if queue is full - BACKPRESSURE!
+            inputQueue.put(item);
+        }
+        
+        public void shutdown() throws InterruptedException {
+            shutdown = true;
+            workers.shutdown();
+            workers.awaitTermination(10, TimeUnit.SECONDS);
+            System.out.println(name + " shut down");
+        }
+        
+        public Map<String, Object> getStatistics() {
+            Map<String, Object> stats = new HashMap<>();
+            stats.put("name", name);
+            stats.put("processed", processed.get());
+            stats.put("failed", failed.get());
+            stats.put("queueSize", inputQueue.size());
+            return stats;
+        }
+    }
+    
+    // Builder for fluent API
+    public static class PipelineBuilder<T> {
+        private final List<StageConfig<?, ?>> stageConfigs = new ArrayList<>();
+        private Class<?> currentType;
+        
+        public PipelineBuilder() {
+            this.currentType = Object.class;
+        }
+        
+        public <O> PipelineBuilder<O> addStage(String name,
+                                                int queueSize,
+                                                int numWorkers,
+                                                Function<T, O> processor) {
+            @SuppressWarnings("unchecked")
+            StageConfig<T, O> config = new StageConfig<>(
+                name, queueSize, numWorkers, (Function<Object, Object>) processor
+            );
+            stageConfigs.add(config);
+            
+            @SuppressWarnings("unchecked")
+            PipelineBuilder<O> next = (PipelineBuilder<O>) this;
+            return next;
+        }
+        
+        public Pipeline<T> build() {
+            List<Stage<?, ?>> stages = new ArrayList<>();
+            BlockingQueue<Object> outputQueue = null;
+            
+            // Build stages in reverse (to create output queues)
+            for (int i = stageConfigs.size() - 1; i >= 0; i--) {
+                StageConfig<?, ?> config = stageConfigs.get(i);
+                
+                @SuppressWarnings("unchecked")
+                Stage<Object, Object> stage = new Stage<>(
+                    config.name,
+                    config.queueSize,
+                    config.numWorkers,
+                    config.processor,
+                    outputQueue
+                );
+                
+                stages.add(0, stage);  // Add to front
+                
+                // This stage's input queue becomes previous stage's output
+                outputQueue = stage.inputQueue;
+            }
+            
+            return new Pipeline<>(stages);
+        }
+        
+        private static class StageConfig<I, O> {
+            final String name;
+            final int queueSize;
+            final int numWorkers;
+            final Function<Object, Object> processor;
+            
+            StageConfig(String name, int queueSize, int numWorkers, Function<Object, Object> processor) {
+                this.name = name;
+                this.queueSize = queueSize;
+                this.numWorkers = numWorkers;
+                this.processor = processor;
+            }
+        }
+    }
+    
+    // Test
+    public static void main(String[] args) throws InterruptedException {
+        Pipeline<String> pipeline = Pipeline.<String>builder()
+            .addStage("Stage-1-Fast", 10, 2, item -> {
+                // Fast processing
+                try { Thread.sleep(10); } catch (InterruptedException e) { }
+                return item.toUpperCase();
+            })
+            .addStage("Stage-2-Medium", 5, 2, item -> {
+                // Medium processing
+                try { Thread.sleep(50); } catch (InterruptedException e) { }
+                return item + "-processed";
+            })
+            .addStage("Stage-3-Slow", 3, 1, item -> {
+                // Slow processing
+                try { Thread.sleep(200); } catch (InterruptedException e) { }
+                System.out.println("  >>> FINAL OUTPUT: " + item);
+                return item + "-done";
+            })
+            .build();
+        
+        pipeline.start();
+        
+        // Submit items
+        System.out.println("\n=== Submitting Items ===");
+        for (int i = 0; i < 20; i++) {
+            final int id = i;
+            new Thread(() -> {
+                try {
+                    pipeline.submit("item-" + id);
+                    System.out.println("Submitted: item-" + id);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }).start();
+            
+            Thread.sleep(20);  // Slow down submission to see backpressure
+        }
+        
+        Thread.sleep(10000);  // Let pipeline process
+        
+        System.out.println("\n=== Statistics ===");
+        Map<String, Object> stats = pipeline.getStatistics();
+        System.out.println("Items processed: " + stats.get("itemsProcessed"));
+        
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> stageStats = (List<Map<String, Object>>) stats.get("stages");
+        for (Map<String, Object> stageStat : stageStats) {
+            System.out.println(stageStat);
+        }
+        
+        pipeline.shutdown();
+    }
+}
+```
+
+---
+
+## Observing Backpressure
+
+**Me**: "Let me trace through what happens with backpressure:
+
+```
+Timeline with Fast Producer, Slow Consumer:
+
+T=0ms:   Submit item-0
+         Stage-1 queue: [item-0] (size: 1/10)
+         
+T=10ms:  Stage-1 processes item-0 → "ITEM-0"
+         Stage-2 queue: ["ITEM-0"] (size: 1/5)
+         
+T=20ms:  Submit item-1
+         Stage-1 queue: [item-1] (size: 1/10)
+         
+T=30ms:  Stage-1 processes item-1 → "ITEM-1"
+         Stage-2 queue: ["ITEM-0", "ITEM-1"] (size: 2/5)
+         
+... Items keep arriving every 20ms ...
+
+T=100ms: Stage-2 queue FULL (size: 5/5)
+         Stage-1 tries to put → BLOCKS!
+         Stage-1 queue starts filling up
+         
+T=120ms: Submit item-6
+         Stage-1 queue: [item-2, item-3, item-4, item-5, item-6] (size: 5/10)
+         
+T=200ms: Stage-1 queue FULL (size: 10/10)
+         Main thread submits item-7 → BLOCKS!
+         Producer is now blocked → BACKPRESSURE WORKING!
+         
+T=210ms: Stage-3 finishes processing "ITEM-0"
+         Stage-2 queue has space → Stage-1 unblocks
+         Stage-1 queue has space → Main thread unblocks
+         
+Result: Slow consumer controls the rate!
+```
+
+**Key observation**: Blocking propagates upstream automatically with bounded queues."
+
+---
+
+## Pitfalls and Edge Cases
+
+**Me**: "Common issues:
+
+### Pitfall 1: Unbounded Queues (No Backpressure!)
+
+```java
+// ❌ WRONG - No backpressure
+BlockingQueue<T> queue = new LinkedBlockingQueue<>();  // Unbounded!
+
+// Fast producer keeps adding, queue grows forever
+// OutOfMemoryError!
+
+// ✓ CORRECT - Bounded queue
+BlockingQueue<T> queue = new ArrayBlockingQueue<>(100);
+// Blocks when full, creating backpressure
+```
+
+### Pitfall 2: Dropping Items Instead of Blocking
+
+```java
+// Option 1: Block (backpressure)
+queue.put(item);  // Blocks if full
+
+// Option 2: Drop (no backpressure)
+if (!queue.offer(item)) {
+    System.err.println("Queue full, dropping item");
+    // Data loss!
+}
+
+// Option 3: Timeout
+if (!queue.offer(item, 1, TimeUnit.SECONDS)) {
+    // Send to dead letter queue
+    deadLetterQueue.add(item);
+}
+```
+
+### Pitfall 3: Poison Pill for Shutdown
+
+```java
+// Problem: How to signal workers to stop?
+
+// Solution: Poison pill
+static final Object POISON_PILL = new Object();
+
+public void shutdown() {
+    // Send poison pills to all workers
+    for (int i = 0; i < numWorkers; i++) {
+        inputQueue.offer(POISON_PILL);
+    }
+}
+
+private void processLoop() {
+    while (true) {
+        Object item = inputQueue.take();
+        if (item == POISON_PILL) {
+            break;  // Stop processing
+        }
+        // Process item...
+    }
+}
+```
+
+### Pitfall 4: Exception Handling Stops Worker
+
+```java
+// ❌ WRONG - Exception kills worker thread
+private void processLoop() {
+    while (!shutdown) {
+        I item = inputQueue.take();
+        O result = processor.apply(item);  // Throws exception → thread dies!
+        outputQueue.put(result);
+    }
+}
+
+// ✓ CORRECT - Catch exceptions
+private void processLoop() {
+    while (!shutdown) {
+        try {
+            I item = inputQueue.take();
+            O result = processor.apply(item);
+            outputQueue.put(result);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            break;
+        } catch (Exception e) {
+            System.err.println("Processing error: " + e);
+            failed.incrementAndGet();
+            // Worker continues!
+        }
+    }
+}
+```
+
+### Pitfall 5: Deadlock with Circular Pipeline
+
+```java
+// ❌ WRONG - Can deadlock!
+// Stage-1 → Queue-1 → Stage-2 → Queue-2 → Stage-1 (circular!)
+
+Stage-1: Waiting to put to Queue-2 (full)
+Stage-2: Waiting to put to Queue-1 (full)
+DEADLOCK!
+
+// Solution: Don't create circular pipelines with bounded queues
+```
+
+### Pitfall 6: Resource Leak on Shutdown
+
+```java
+// ❌ WRONG - Threads not properly stopped
+public void shutdown() {
+    shutdown = true;  // Set flag
+    // Threads might still be blocked on queue.take()!
+}
+
+// ✓ CORRECT - Interrupt threads
+public void shutdown() throws InterruptedException {
+    shutdown = true;
+    workers.shutdownNow();  // Interrupts all threads
+    workers.awaitTermination(10, TimeUnit.SECONDS);
+}
+```
+"
+
+---
+
+## Advanced: Non-Blocking Backpressure
+
+**Me**: "For comparison, here's reactive-style backpressure:
+
+### Reactive Streams (Conceptual)
+
+```java
+public interface Publisher<T> {
+    void subscribe(Subscriber<T> subscriber);
+}
+
+public interface Subscriber<T> {
+    void onSubscribe(Subscription subscription);
+    void onNext(T item);
+    void onError(Throwable error);
+    void onComplete();
+}
+
+public interface Subscription {
+    void request(long n);  // Request n items (backpressure!)
+    void cancel();
+}
+
+// Usage
+subscriber.onSubscribe(subscription);
+subscription.request(10);  // "I can handle 10 items"
+
+// Publisher only sends 10 items
+// When subscriber processes some:
+subscription.request(5);  // "I can handle 5 more"
+```
+
+**Comparison**:
+
+| Approach | Blocking Pipeline | Reactive Streams |
+|----------|------------------|------------------|
+| **Mechanism** | Bounded queues block | Request(n) signals capacity |
+| **Thread Model** | Thread per stage | Event-driven, fewer threads |
+| **Complexity** | Simple | Complex |
+| **Memory** | Queues buffer items | Minimal buffering |
+| **Use Case** | Traditional ETL | High-throughput streaming |
+
+**For interview**: Stick with blocking pipeline (simpler, easier to reason about)."
+
+---
+
+## Interview Follow-Up Questions
+
+**Q1: How to handle fan-out (one stage to multiple)?**
+
+```java
+public class FanOutStage<I, O> {
+    private final Function<I, O> processor;
+    private final List<BlockingQueue<O>> outputQueues;
+    
+    public void process(I item) throws InterruptedException {
+        O result = processor.apply(item);
+        
+        // Send to all output queues
+        for (BlockingQueue<O> queue : outputQueues) {
+            queue.put(result);  // Blocks if any queue is full
+        }
+    }
+}
+```
+
+**Q2: How to handle fan-in (multiple stages to one)?**
+
+```java
+public class FanInStage<I, O> {
+    private final Function<I, O> processor;
+    private final List<BlockingQueue<I>> inputQueues;
+    private final BlockingQueue<O> outputQueue;
+    
+    public void start() {
+        // One worker per input queue
+        for (BlockingQueue<I> inputQueue : inputQueues) {
+            new Thread(() -> {
+                while (true) {
+                    I item = inputQueue.take();
+                    O result = processor.apply(item);
+                    outputQueue.put(result);
+                }
+            }).start();
+        }
+    }
+}
+```
+
+**Q3: How to monitor backpressure?**
+
+```java
+public class MonitoredQueue<T> {
+    private final BlockingQueue<T> queue;
+    private final AtomicLong totalWaitTime = new AtomicLong(0);
+    private final AtomicInteger putAttempts = new AtomicInteger(0);
+    
+    public void put(T item) throws InterruptedException {
+        long start = System.nanoTime();
+        queue.put(item);
+        long waitTime = System.nanoTime() - start;
+        
+        totalWaitTime.addAndGet(waitTime);
+        putAttempts.incrementAndGet();
+    }
+    
+    public double getAverageWaitTimeMs() {
+        int attempts = putAttempts.get();
+        return attempts == 0 ? 0 : 
+            (totalWaitTime.get() / 1_000_000.0) / attempts;
+    }
+}
+
+// If average wait time is high → backpressure is happening
+```
+
 ---
