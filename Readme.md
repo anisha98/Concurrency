@@ -4298,3 +4298,1755 @@ The key insight: **Prevention (lock ordering) is simpler and faster than detecti
 ---
 
 **END OF DOCUMENT**
+
+# Remaining Concurrency Design Problems - Interview Format
+
+---
+
+## Table of Contents
+
+1. [Batch Processor with Auto-Flush](#batch-processor-with-auto-flush)
+2. [TTL Cache with Size Limits](#ttl-cache-with-size-limits)
+3. [Rate Limiter](#rate-limiter)
+4. [Multi-Stage Pipeline with Backpressure](#multi-stage-pipeline-with-backpressure)
+5. [Write-Behind Cache](#write-behind-cache)
+6. [Real-Time Metrics Aggregator](#real-time-metrics-aggregator)
+7. [Producer-Consumer with Multiple Queues](#producer-consumer-with-multiple-queues)
+8. [Concurrent Data Deduplicator](#concurrent-data-deduplicator)
+9. [Multi-Level Cache](#multi-level-cache)
+10. [Thread Pool with Dynamic Sizing](#thread-pool-with-dynamic-sizing)
+11. [Concurrent Result Aggregator](#concurrent-result-aggregator)
+
+---
+
+# Batch Processor with Auto-Flush
+
+## Problem Introduction
+
+**Interviewer**: "Design a batch processor that collects items and processes them in batches. It should auto-flush when the batch reaches a certain size OR after a timeout period."
+
+**Me**: "Great! Let me clarify:
+
+**Scenario**:
+```
+Items arrive: I1, I2, I3, I4, I5, I6...
+Batch size: 5
+Timeout: 2 seconds
+
+Scenario 1: Items arrive fast
+I1, I2, I3, I4, I5 → FLUSH (size reached)
+I6, I7, I8, I9, I10 → FLUSH (size reached)
+
+Scenario 2: Items arrive slowly
+I1, I2, I3 → ... 2 seconds pass → FLUSH (timeout)
+I4 → ... 2 seconds pass → FLUSH (timeout)
+```
+
+**Questions**:
+1. **Batch size and timeout**: Both configurable?
+2. **Concurrent producers**: Multiple threads adding items?
+3. **Processing**: Synchronous or async? Who processes?
+4. **Ordering**: Must items be processed in order?
+5. **Failure handling**: What if batch processing fails?
+6. **Shutdown**: How to handle items in buffer during shutdown?
+
+**Assumptions**:
+- Both size and timeout triggers
+- Multiple concurrent producers
+- Async processing (background thread)
+- Order preserved within batch
+- Simple error logging
+- Flush all on shutdown
+
+Does this sound right?"
+
+**Interviewer**: "Yes, exactly. Start with basic implementation."
+
+---
+
+## High-Level Design
+
+**Me**: "Here's my approach:
+
+### Components:
+```
+BatchProcessor
+├── Buffer (stores items until batch ready)
+├── Lock + Condition (thread-safe add)
+├── Flusher Thread (monitors timeout)
+├── Batch Handler (processes batches)
+└── Statistics
+```
+
+### Two triggers:
+1. **Size trigger**: When buffer.size() >= batchSize
+2. **Time trigger**: When lastFlushTime + timeout < now
+
+### Key challenge:
+**How to handle timeout-based flushing while allowing concurrent adds?**
+
+**Solution**: Background thread that wakes up periodically to check timeout."
+
+---
+
+## Step 1: Basic Structure
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
+
+public class BatchProcessor<T> {
+    
+    // Configuration
+    private final int batchSize;
+    private final long flushIntervalMs;
+    private final BatchHandler<T> handler;
+    
+    // Buffer
+    private final List<T> buffer;
+    private final Lock lock;
+    private final Condition notEmpty;
+    
+    // State
+    private long lastFlushTime;
+    private volatile boolean shutdown = false;
+    
+    // Background flusher
+    private final Thread flusher;
+    
+    // Statistics
+    private final AtomicLong itemsProcessed = new AtomicLong(0);
+    private final AtomicLong batchesProcessed = new AtomicLong(0);
+    
+    public interface BatchHandler<T> {
+        void processBatch(List<T> batch);
+    }
+    
+    public BatchProcessor(int batchSize, long flushIntervalMs, BatchHandler<T> handler) {
+        this.batchSize = batchSize;
+        this.flushIntervalMs = flushIntervalMs;
+        this.handler = handler;
+        
+        this.buffer = new ArrayList<>(batchSize);
+        this.lock = new ReentrantLock();
+        this.notEmpty = lock.newCondition();
+        
+        this.lastFlushTime = System.currentTimeMillis();
+        
+        // Start background flusher
+        this.flusher = new Thread(this::flushPeriodically, "BatchFlusher");
+        this.flusher.setDaemon(true);
+        this.flusher.start();
+    }
+    
+    private void flushPeriodically() {
+        // Will implement next
+    }
+}
+```
+
+---
+
+## Step 2: The add() Method
+
+```java
+public void add(T item) throws InterruptedException {
+    if (item == null) {
+        throw new IllegalArgumentException("Item cannot be null");
+    }
+    
+    lock.lock();
+    try {
+        if (shutdown) {
+            throw new IllegalStateException("Processor is shut down");
+        }
+        
+        buffer.add(item);
+        System.out.println(Thread.currentThread().getName() + 
+            " added item. Buffer size: " + buffer.size());
+        
+        // Check if batch is full
+        if (buffer.size() >= batchSize) {
+            flush();  // Flush immediately
+        }
+        
+        // Signal flusher thread
+        notEmpty.signal();
+        
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+**Key decision**: Call `flush()` while holding lock vs outside lock?
+
+```java
+// Option 1: Flush while holding lock (BLOCKING)
+if (buffer.size() >= batchSize) {
+    flush();  // Other threads blocked during processing!
+}
+
+// Option 2: Flush outside lock (BETTER)
+List<T> toFlush = null;
+lock.lock();
+try {
+    if (buffer.size() >= batchSize) {
+        toFlush = new ArrayList<>(buffer);
+        buffer.clear();
+        lastFlushTime = System.currentTimeMillis();
+    }
+} finally {
+    lock.unlock();
+}
+
+if (toFlush != null) {
+    processBatch(toFlush);  // Outside lock!
+}
+```
+
+**Better implementation**:
+
+```java
+public void add(T item) throws InterruptedException {
+    if (item == null) {
+        throw new IllegalArgumentException("Item cannot be null");
+    }
+    
+    List<T> toFlush = null;
+    
+    lock.lock();
+    try {
+        if (shutdown) {
+            throw new IllegalStateException("Processor is shut down");
+        }
+        
+        buffer.add(item);
+        System.out.println(Thread.currentThread().getName() + 
+            " added item. Buffer size: " + buffer.size());
+        
+        // Check if batch is full
+        if (buffer.size() >= batchSize) {
+            toFlush = new ArrayList<>(buffer);
+            buffer.clear();
+            lastFlushTime = System.currentTimeMillis();
+            System.out.println("Size trigger: Flushing batch of " + toFlush.size());
+        }
+        
+        notEmpty.signal();
+        
+    } finally {
+        lock.unlock();
+    }
+    
+    // Process outside lock
+    if (toFlush != null) {
+        processBatch(toFlush);
+    }
+}
+
+private void processBatch(List<T> batch) {
+    try {
+        handler.processBatch(batch);
+        itemsProcessed.addAndGet(batch.size());
+        batchesProcessed.incrementAndGet();
+    } catch (Exception e) {
+        System.err.println("Error processing batch: " + e.getMessage());
+    }
+}
+```
+
+---
+
+## Step 3: Periodic Flusher Thread
+
+```java
+private void flushPeriodically() {
+    while (!shutdown) {
+        try {
+            lock.lock();
+            try {
+                // Wait until timeout or notified
+                while (!shutdown && buffer.isEmpty()) {
+                    notEmpty.await(flushIntervalMs, TimeUnit.MILLISECONDS);
+                }
+                
+                if (shutdown) {
+                    break;
+                }
+                
+                // Check if timeout elapsed
+                long now = System.currentTimeMillis();
+                long elapsed = now - lastFlushTime;
+                
+                if (elapsed >= flushIntervalMs && !buffer.isEmpty()) {
+                    System.out.println("Timeout trigger: Flushing batch of " + buffer.size());
+                    List<T> toFlush = new ArrayList<>(buffer);
+                    buffer.clear();
+                    lastFlushTime = now;
+                    
+                    // Process outside lock
+                    lock.unlock();
+                    try {
+                        processBatch(toFlush);
+                    } finally {
+                        lock.lock();
+                    }
+                }
+                
+            } finally {
+                lock.unlock();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            break;
+        }
+    }
+}
+```
+
+**Key point**: Process batch outside lock to avoid blocking producers!
+
+---
+
+## Step 4: Shutdown and Force Flush
+
+```java
+public void forceFlush() {
+    List<T> toFlush = null;
+    
+    lock.lock();
+    try {
+        if (!buffer.isEmpty()) {
+            toFlush = new ArrayList<>(buffer);
+            buffer.clear();
+            lastFlushTime = System.currentTimeMillis();
+            System.out.println("Force flush: " + toFlush.size() + " items");
+        }
+    } finally {
+        lock.unlock();
+    }
+    
+    if (toFlush != null) {
+        processBatch(toFlush);
+    }
+}
+
+public void shutdown() throws InterruptedException {
+    lock.lock();
+    try {
+        shutdown = true;
+        notEmpty.signalAll();
+    } finally {
+        lock.unlock();
+    }
+    
+    // Wait for flusher thread
+    flusher.join();
+    
+    // Final flush
+    forceFlush();
+    
+    System.out.println("Batch processor shut down");
+}
+
+public Map<String, Long> getStatistics() {
+    Map<String, Long> stats = new HashMap<>();
+    stats.put("itemsProcessed", itemsProcessed.get());
+    stats.put("batchesProcessed", batchesProcessed.get());
+    
+    lock.lock();
+    try {
+        stats.put("itemsInBuffer", (long) buffer.size());
+    } finally {
+        lock.unlock();
+    }
+    
+    return stats;
+}
+```
+
+---
+
+## Complete Implementation
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
+import java.util.concurrent.atomic.*;
+
+public class BatchProcessor<T> {
+    
+    // Configuration
+    private final int batchSize;
+    private final long flushIntervalMs;
+    private final BatchHandler<T> handler;
+    
+    // Buffer
+    private final List<T> buffer;
+    private final Lock lock;
+    private final Condition notEmpty;
+    
+    // State
+    private long lastFlushTime;
+    private volatile boolean shutdown = false;
+    
+    // Background flusher
+    private final Thread flusher;
+    
+    // Statistics
+    private final AtomicLong itemsProcessed = new AtomicLong(0);
+    private final AtomicLong batchesProcessed = new AtomicLong(0);
+    private final AtomicLong sizeTriggers = new AtomicLong(0);
+    private final AtomicLong timeTriggers = new AtomicLong(0);
+    
+    public interface BatchHandler<T> {
+        void processBatch(List<T> batch);
+    }
+    
+    public BatchProcessor(int batchSize, long flushIntervalMs, BatchHandler<T> handler) {
+        if (batchSize <= 0) {
+            throw new IllegalArgumentException("Batch size must be positive");
+        }
+        if (flushIntervalMs <= 0) {
+            throw new IllegalArgumentException("Flush interval must be positive");
+        }
+        if (handler == null) {
+            throw new IllegalArgumentException("Handler cannot be null");
+        }
+        
+        this.batchSize = batchSize;
+        this.flushIntervalMs = flushIntervalMs;
+        this.handler = handler;
+        
+        this.buffer = new ArrayList<>(batchSize);
+        this.lock = new ReentrantLock();
+        this.notEmpty = lock.newCondition();
+        
+        this.lastFlushTime = System.currentTimeMillis();
+        
+        this.flusher = new Thread(this::flushPeriodically, "BatchFlusher");
+        this.flusher.setDaemon(true);
+        this.flusher.start();
+    }
+    
+    public void add(T item) throws InterruptedException {
+        if (item == null) {
+            throw new IllegalArgumentException("Item cannot be null");
+        }
+        
+        List<T> toFlush = null;
+        
+        lock.lock();
+        try {
+            if (shutdown) {
+                throw new IllegalStateException("Processor is shut down");
+            }
+            
+            buffer.add(item);
+            
+            // Check if batch is full
+            if (buffer.size() >= batchSize) {
+                toFlush = new ArrayList<>(buffer);
+                buffer.clear();
+                lastFlushTime = System.currentTimeMillis();
+                sizeTriggers.incrementAndGet();
+                System.out.println(Thread.currentThread().getName() + 
+                    " - Size trigger: Flushing batch of " + toFlush.size());
+            }
+            
+            notEmpty.signal();
+            
+        } finally {
+            lock.unlock();
+        }
+        
+        // Process outside lock
+        if (toFlush != null) {
+            processBatch(toFlush);
+        }
+    }
+    
+    private void flushPeriodically() {
+        while (!shutdown) {
+            try {
+                List<T> toFlush = null;
+                
+                lock.lock();
+                try {
+                    // Wait until timeout or notified
+                    while (!shutdown && buffer.isEmpty()) {
+                        notEmpty.await(flushIntervalMs, TimeUnit.MILLISECONDS);
+                    }
+                    
+                    if (shutdown) {
+                        break;
+                    }
+                    
+                    // Check if timeout elapsed
+                    long now = System.currentTimeMillis();
+                    long elapsed = now - lastFlushTime;
+                    
+                    if (elapsed >= flushIntervalMs && !buffer.isEmpty()) {
+                        toFlush = new ArrayList<>(buffer);
+                        buffer.clear();
+                        lastFlushTime = now;
+                        timeTriggers.incrementAndGet();
+                        System.out.println("Timeout trigger: Flushing batch of " + toFlush.size());
+                    }
+                    
+                } finally {
+                    lock.unlock();
+                }
+                
+                // Process outside lock
+                if (toFlush != null) {
+                    processBatch(toFlush);
+                }
+                
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+    
+    private void processBatch(List<T> batch) {
+        try {
+            handler.processBatch(batch);
+            itemsProcessed.addAndGet(batch.size());
+            batchesProcessed.incrementAndGet();
+        } catch (Exception e) {
+            System.err.println("Error processing batch: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+    
+    public void forceFlush() {
+        List<T> toFlush = null;
+        
+        lock.lock();
+        try {
+            if (!buffer.isEmpty()) {
+                toFlush = new ArrayList<>(buffer);
+                buffer.clear();
+                lastFlushTime = System.currentTimeMillis();
+                System.out.println("Force flush: " + toFlush.size() + " items");
+            }
+        } finally {
+            lock.unlock();
+        }
+        
+        if (toFlush != null) {
+            processBatch(toFlush);
+        }
+    }
+    
+    public void shutdown() throws InterruptedException {
+        lock.lock();
+        try {
+            shutdown = true;
+            notEmpty.signalAll();
+        } finally {
+            lock.unlock();
+        }
+        
+        // Wait for flusher thread
+        flusher.join();
+        
+        // Final flush
+        forceFlush();
+        
+        System.out.println("Batch processor shut down");
+    }
+    
+    public Map<String, Long> getStatistics() {
+        Map<String, Long> stats = new HashMap<>();
+        stats.put("itemsProcessed", itemsProcessed.get());
+        stats.put("batchesProcessed", batchesProcessed.get());
+        stats.put("sizeTriggers", sizeTriggers.get());
+        stats.put("timeTriggers", timeTriggers.get());
+        
+        lock.lock();
+        try {
+            stats.put("itemsInBuffer", (long) buffer.size());
+        } finally {
+            lock.unlock();
+        }
+        
+        return stats;
+    }
+    
+    // Test
+    public static void main(String[] args) throws InterruptedException {
+        BatchProcessor<String> processor = new BatchProcessor<>(
+            5,      // Batch size
+            2000,   // Flush every 2 seconds
+            batch -> {
+                System.out.println(">>> PROCESSING BATCH: " + batch);
+                try {
+                    Thread.sleep(100); // Simulate processing
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        );
+        
+        // Scenario 1: Fast arrival (size trigger)
+        System.out.println("\n=== Scenario 1: Fast Arrival ===");
+        for (int i = 0; i < 12; i++) {
+            processor.add("item-" + i);
+            Thread.sleep(50);
+        }
+        
+        Thread.sleep(3000);
+        
+        // Scenario 2: Slow arrival (timeout trigger)
+        System.out.println("\n=== Scenario 2: Slow Arrival ===");
+        for (int i = 20; i < 23; i++) {
+            processor.add("item-" + i);
+            Thread.sleep(500);
+        }
+        
+        Thread.sleep(3000);
+        
+        System.out.println("\n=== Statistics ===");
+        processor.getStatistics().forEach((key, value) -> 
+            System.out.println(key + ": " + value));
+        
+        processor.shutdown();
+    }
+}
+```
+
+---
+
+## Pitfalls and Edge Cases
+
+**Me**: "Let me discuss the gotchas:
+
+### Pitfall 1: Processing While Holding Lock
+
+```java
+// ❌ WRONG - Blocks all producers during processing
+lock.lock();
+try {
+    if (buffer.size() >= batchSize) {
+        handler.processBatch(buffer);  // Long operation under lock!
+        buffer.clear();
+    }
+} finally {
+    lock.unlock();
+}
+
+// ✓ CORRECT - Process outside lock
+List<T> toFlush = null;
+lock.lock();
+try {
+    if (buffer.size() >= batchSize) {
+        toFlush = new ArrayList<>(buffer);
+        buffer.clear();
+    }
+} finally {
+    lock.unlock();
+}
+
+if (toFlush != null) {
+    handler.processBatch(toFlush);  // Outside lock
+}
+```
+
+### Pitfall 2: Race Between Size and Time Triggers
+
+```java
+// Problem scenario:
+Thread-1 (producer): Adds 5th item → triggers size flush
+Thread-2 (flusher): Wakes up → sees empty buffer (already flushed)
+
+// Solution: Check if buffer is empty before flushing
+if (elapsed >= flushIntervalMs && !buffer.isEmpty()) {
+    // Safe to flush
+}
+```
+
+### Pitfall 3: Lost Items on Shutdown
+
+```java
+// ❌ WRONG - Items in buffer are lost
+public void shutdown() {
+    shutdown = true;
+    // Buffer has items but never flushed!
+}
+
+// ✓ CORRECT - Final flush
+public void shutdown() throws InterruptedException {
+    shutdown = true;
+    flusher.join();
+    forceFlush();  // Flush remaining items
+}
+```
+
+### Pitfall 4: Time Drift
+
+```java
+// Problem: If items arrive frequently, timeout never triggers!
+add(item1) → lastFlushTime = T0
+add(item2) → lastFlushTime = T0 (not updated)
+add(item3) → lastFlushTime = T0 (not updated)
+... timeout should trigger but size trigger happens first
+
+// This is actually OK - size trigger takes precedence
+// But be aware of the behavior
+```
+
+### Pitfall 5: Handler Throws Exception
+
+```java
+// ❌ WRONG - Exception kills flusher thread
+private void processBatch(List<T> batch) {
+    handler.processBatch(batch);  // Throws exception
+    // Thread dies!
+}
+
+// ✓ CORRECT - Catch and log
+private void processBatch(List<T> batch) {
+    try {
+        handler.processBatch(batch);
+    } catch (Exception e) {
+        System.err.println("Error processing batch: " + e);
+        // Thread continues
+    }
+}
+```
+
+### Pitfall 6: Buffer Capacity Growth
+
+```java
+// Problem: ArrayList grows unbounded if items arrive faster than processing
+buffer = new ArrayList<>();  // Starts at 10, doubles when full
+
+// Solution: Use bounded buffer with backpressure
+if (buffer.size() >= MAX_BUFFER_SIZE) {
+    // Option 1: Block
+    bufferNotFull.await();
+    
+    // Option 2: Drop
+    System.err.println("Buffer full, dropping item");
+    return;
+    
+    // Option 3: Flush immediately
+    forceFlush();
+}
+```
+"
+
+---
+
+## Lock-Free Optimization
+
+**Me**: "Can we optimize with lock-free structures?
+
+### Current Bottleneck: Single Lock
+
+```java
+// All producers contend on same lock
+Thread-1: lock.lock() → add → unlock
+Thread-2: lock.lock() → BLOCKED
+Thread-3: lock.lock() → BLOCKED
+```
+
+### Option 1: Lock-Free Queue (Partial Solution)
+
+```java
+public class LockFreeBatchProcessor<T> {
+    
+    private final ConcurrentLinkedQueue<T> buffer;
+    private final AtomicInteger bufferSize;
+    private final int batchSize;
+    
+    public void add(T item) {
+        buffer.offer(item);  // Lock-free!
+        int size = bufferSize.incrementAndGet();  // Lock-free!
+        
+        if (size >= batchSize) {
+            // Try to flush
+            tryFlush();
+        }
+    }
+    
+    private void tryFlush() {
+        // Problem: How to atomically drain queue?
+        // Multiple threads might try to flush simultaneously!
+        
+        // Solution: Use atomic flag
+        if (flushing.compareAndSet(false, true)) {
+            try {
+                List<T> batch = new ArrayList<>();
+                T item;
+                while (batch.size() < batchSize && (item = buffer.poll()) != null) {
+                    batch.add(item);
+                    bufferSize.decrementAndGet();
+                }
+                
+                if (!batch.isEmpty()) {
+                    processBatch(batch);
+                }
+            } finally {
+                flushing.set(false);
+            }
+        }
+    }
+}
+```
+
+**Problem**: Timeout-based flushing still needs coordination!
+
+### Option 2: Sharded Buffers
+
+```java
+public class ShardedBatchProcessor<T> {
+    
+    private final BatchProcessor<T>[] shards;
+    
+    public ShardedBatchProcessor(int numShards, int batchSize, long timeout, BatchHandler<T> handler) {
+        this.shards = new BatchProcessor[numShards];
+        for (int i = 0; i < numShards; i++) {
+            shards[i] = new BatchProcessor<>(batchSize, timeout, handler);
+        }
+    }
+    
+    public void add(T item) throws InterruptedException {
+        // Route to shard based on thread ID
+        int shard = (int) (Thread.currentThread().getId() % shards.length);
+        shards[shard].add(item);  // Less contention per shard!
+    }
+}
+```
+
+**Trade-off**:
+- ✓ Less contention per shard
+- ✗ More complex
+- ✗ Batches are per-shard (might be smaller)
+
+### Recommendation
+
+**For this problem, locks are appropriate** because:
+1. Timeout-based flushing needs coordination anyway
+2. Batch creation requires atomic buffer drain
+3. Lock is held briefly (just copying list)
+4. Processing happens outside lock
+
+**Lock-free helps** only if:
+- Pure size-based flushing (no timeout)
+- Acceptable to have multiple concurrent flushes
+- Can tolerate imprecise batch sizes
+"
+
+---
+
+## Interview Follow-Up Questions
+
+**Q1: What if batch processing fails? Should we retry?**
+
+```java
+private void processBatch(List<T> batch) {
+    int maxRetries = 3;
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            handler.processBatch(batch);
+            return;  // Success
+        } catch (Exception e) {
+            if (attempt == maxRetries - 1) {
+                // Failed all retries
+                sendToDeadLetterQueue(batch);
+            } else {
+                Thread.sleep(1000 * (1 << attempt));  // Exponential backoff
+            }
+        }
+    }
+}
+```
+
+**Q2: How to handle backpressure if items arrive too fast?**
+
+```java
+public void add(T item) throws InterruptedException {
+    lock.lock();
+    try {
+        // Wait if buffer is too large
+        while (buffer.size() >= MAX_BUFFER_SIZE) {
+            bufferNotFull.await();  // Block producer
+        }
+        
+        buffer.add(item);
+        
+        if (buffer.size() >= batchSize) {
+            // Flush and signal
+            flush();
+            bufferNotFull.signalAll();
+        }
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+**Q3: How to test this?**
+
+```java
+@Test
+public void testSizeTrigger() throws InterruptedException {
+    List<List<String>> batches = new ArrayList<>();
+    BatchProcessor<String> processor = new BatchProcessor<>(
+        3, 10000, batches::add
+    );
+    
+    processor.add("1");
+    processor.add("2");
+    processor.add("3");  // Should trigger
+    
+    Thread.sleep(100);
+    assertEquals(1, batches.size());
+    assertEquals(Arrays.asList("1", "2", "3"), batches.get(0));
+}
+
+@Test
+public void testTimeoutTrigger() throws InterruptedException {
+    List<List<String>> batches = new ArrayList<>();
+    BatchProcessor<String> processor = new BatchProcessor<>(
+        100, 500, batches::add
+    );
+    
+    processor.add("1");
+    processor.add("2");
+    
+    Thread.sleep(600);  // Wait for timeout
+    
+    assertEquals(1, batches.size());
+    assertEquals(Arrays.asList("1", "2"), batches.get(0));
+}
+```
+
+---
+
+# TTL Cache with Size Limits
+
+## Problem Introduction
+
+**Interviewer**: "Design a thread-safe cache with TTL (time-to-live) and size limits. Items expire after a certain time and the cache has a maximum size."
+
+**Me**: "Interesting! Let me clarify:
+
+**Requirements**:
+```
+Cache with:
+1. TTL: Items expire after X milliseconds
+2. Size limit: Max N items
+3. Eviction: Remove expired or least-recently-used items
+4. Thread-safe: Multiple threads reading/writing
+
+Example:
+cache.put("key1", "value1", 5000);  // Expires in 5 seconds
+cache.get("key1");  // Returns "value1"
+... 6 seconds later ...
+cache.get("key1");  // Returns null (expired)
+```
+
+**Questions**:
+1. **Eviction policy**: LRU, LFU, or just expiry-based?
+2. **Expiry check**: On access or background cleanup?
+3. **Size enforcement**: Block when full or evict?
+4. **Read-heavy or write-heavy**: Optimize for reads?
+5. **TTL**: Per-item or global default?
+
+**Assumptions**:
+- LRU + TTL eviction
+- Check expiry on access + background cleanup
+- Evict automatically when full
+- Read-heavy (use ReadWriteLock)
+- Per-item TTL with default
+
+Sound good?"
+
+**Interviewer**: "Perfect. Start with the design."
+
+---
+
+## High-Level Design
+
+**Me**: "Here's the approach:
+
+### Data Structure:
+```
+TTLCache
+├── ConcurrentHashMap<K, CacheEntry<V>>
+│   └── CacheEntry: value, expiryTime, lastAccess
+├── LinkedHashMap for LRU ordering (or manual doubly-linked list)
+├── ReadWriteLock (many readers, few writers)
+├── Cleanup thread (removes expired entries)
+└── Statistics
+```
+
+### Eviction Strategy:
+1. **On put()**: If size > maxSize, evict LRU
+2. **On get()**: Check if expired, remove if yes
+3. **Background**: Periodic cleanup of expired entries
+
+### Key Design Decision:
+**Use ConcurrentHashMap or Lock-based?**
+
+```
+Option 1: ConcurrentHashMap
+✓ Built-in thread safety
+✓ Lock striping (good concurrency)
+✗ Can't easily maintain LRU order
+
+Option 2: HashMap + ReadWriteLock
+✓ Can use LinkedHashMap for LRU
+✓ Readers don't block each other
+✗ Writers block readers
+
+Hybrid: ConcurrentHashMap + separate LRU tracking
+```
+
+I'll show both approaches."
+
+---
+
+## Approach 1: ConcurrentHashMap-Based
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class TTLCache<K, V> {
+    
+    static class CacheEntry<V> {
+        final V value;
+        final long expiryTime;
+        volatile long lastAccessTime;
+        
+        CacheEntry(V value, long ttlMs) {
+            this.value = value;
+            this.expiryTime = System.currentTimeMillis() + ttlMs;
+            this.lastAccessTime = System.currentTimeMillis();
+        }
+        
+        boolean isExpired() {
+            return System.currentTimeMillis() > expiryTime;
+        }
+    }
+    
+    private final ConcurrentHashMap<K, CacheEntry<V>> cache;
+    private final int maxSize;
+    private final long defaultTtlMs;
+    
+    // For LRU tracking (approximation)
+    private final ConcurrentLinkedQueue<K> accessOrder;
+    
+    // Cleanup
+    private final ScheduledExecutorService cleaner;
+    
+    // Statistics
+    private final AtomicLong hits = new AtomicLong(0);
+    private final AtomicLong misses = new AtomicLong(0);
+    private final AtomicLong evictions = new AtomicLong(0);
+    
+    public TTLCache(int maxSize, long defaultTtlMs) {
+        this.cache = new ConcurrentHashMap<>();
+        this.maxSize = maxSize;
+        this.defaultTtlMs = defaultTtlMs;
+        this.accessOrder = new ConcurrentLinkedQueue<>();
+        
+        // Periodic cleanup
+        this.cleaner = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "CacheCleaner");
+            t.setDaemon(true);
+            return t;
+        });
+        
+        cleaner.scheduleAtFixedRate(
+            this::cleanupExpired,
+            1000,
+            1000,
+            TimeUnit.MILLISECONDS
+        );
+    }
+    
+    public void put(K key, V value) {
+        put(key, value, defaultTtlMs);
+    }
+    
+    public void put(K key, V value, long ttlMs) {
+        if (key == null || value == null) {
+            throw new IllegalArgumentException("Key and value cannot be null");
+        }
+        
+        // Check size limit
+        if (cache.size() >= maxSize && !cache.containsKey(key)) {
+            evictOne();
+        }
+        
+        CacheEntry<V> entry = new CacheEntry<>(value, ttlMs);
+        cache.put(key, entry);
+        accessOrder.offer(key);  // Track for LRU
+        
+        System.out.println("Put: " + key + " (TTL: " + ttlMs + "ms)");
+    }
+    
+    public V get(K key) {
+        CacheEntry<V> entry = cache.get(key);
+        
+        if (entry == null) {
+            misses.incrementAndGet();
+            return null;
+        }
+        
+        if (entry.isExpired()) {
+            // Expired, remove it
+            cache.remove(key);
+            evictions.incrementAndGet();
+            misses.incrementAndGet();
+            System.out.println("Get: " + key + " - EXPIRED");
+            return null;
+        }
+        
+        // Update access time
+        entry.lastAccessTime = System.currentTimeMillis();
+        accessOrder.offer(key);  // Move to end (approximate LRU)
+        hits.incrementAndGet();
+        
+        return entry.value;
+    }
+    
+    public void remove(K key) {
+        if (cache.remove(key) != null) {
+            System.out.println("Removed: " + key);
+        }
+    }
+    
+    private void evictOne() {
+        // Evict least recently used (approximate)
+        K keyToEvict = accessOrder.poll();
+        
+        while (keyToEvict != null) {
+            if (cache.remove(keyToEvict) != null) {
+                evictions.incrementAndGet();
+                System.out.println("Evicted (LRU): " + keyToEvict);
+                return;
+            }
+            // Key already removed, try next
+            keyToEvict = accessOrder.poll();
+        }
+        
+        // Fallback: remove any key
+        K anyKey = cache.keys().nextElement();
+        if (anyKey != null) {
+            cache.remove(anyKey);
+            evictions.incrementAndGet();
+            System.out.println("Evicted (any): " + anyKey);
+        }
+    }
+    
+    private void cleanupExpired() {
+        int cleaned = 0;
+        
+        Iterator<Map.Entry<K, CacheEntry<V>>> iterator = cache.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<K, CacheEntry<V>> entry = iterator.next();
+            if (entry.getValue().isExpired()) {
+                iterator.remove();
+                cleaned++;
+                evictions.incrementAndGet();
+            }
+        }
+        
+        if (cleaned > 0) {
+            System.out.println("Cleanup: removed " + cleaned + " expired entries");
+        }
+    }
+    
+    public void shutdown() {
+        cleaner.shutdown();
+    }
+    
+    public Map<String, Long> getStatistics() {
+        Map<String, Long> stats = new HashMap<>();
+        stats.put("size", (long) cache.size());
+        stats.put("hits", hits.get());
+        stats.put("misses", misses.get());
+        stats.put("evictions", evictions.get());
+        
+        long total = hits.get() + misses.get();
+        stats.put("hitRate", total == 0 ? 0 : (hits.get() * 100 / total));
+        
+        return stats;
+    }
+}
+```
+
+**Problem with this approach**: Access order queue is not perfect LRU (duplicates possible).
+
+---
+
+## Approach 2: LinkedHashMap with ReadWriteLock (Better LRU)
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
+import java.util.concurrent.atomic.*;
+
+public class TTLCacheV2<K, V> {
+    
+    static class CacheEntry<V> {
+        final V value;
+        final long expiryTime;
+        
+        CacheEntry(V value, long ttlMs) {
+            this.value = value;
+            this.expiryTime = System.currentTimeMillis() + ttlMs;
+        }
+        
+        boolean isExpired() {
+            return System.currentTimeMillis() > expiryTime;
+        }
+    }
+    
+    // LRU map with access-order
+    private final LinkedHashMap<K, CacheEntry<V>> cache;
+    private final int maxSize;
+    private final long defaultTtlMs;
+    
+    // Read-write lock for better concurrency
+    private final ReadWriteLock lock = new ReentrantReadWriteLock();
+    
+    // Cleanup
+    private final ScheduledExecutorService cleaner;
+    
+    // Statistics
+    private final AtomicLong hits = new AtomicLong(0);
+    private final AtomicLong misses = new AtomicLong(0);
+    private final AtomicLong evictions = new AtomicLong(0);
+    
+    public TTLCacheV2(int maxSize, long defaultTtlMs) {
+        this.maxSize = maxSize;
+        this.defaultTtlMs = defaultTtlMs;
+        
+        // LinkedHashMap with access-order and automatic eviction
+        this.cache = new LinkedHashMap<K, CacheEntry<V>>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<K, CacheEntry<V>> eldest) {
+                boolean shouldRemove = size() > maxSize;
+                if (shouldRemove) {
+                    evictions.incrementAndGet();
+                    System.out.println("Auto-evicted (LRU): " + eldest.getKey());
+                }
+                return shouldRemove;
+            }
+        };
+        
+        // Periodic cleanup
+        this.cleaner = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "CacheCleaner");
+            t.setDaemon(true);
+            return t;
+        });
+        
+        cleaner.scheduleAtFixedRate(
+            this::cleanupExpired,
+            1000,
+            1000,
+            TimeUnit.MILLISECONDS
+        );
+    }
+    
+    public void put(K key, V value) {
+        put(key, value, defaultTtlMs);
+    }
+    
+    public void put(K key, V value, long ttlMs) {
+        if (key == null || value == null) {
+            throw new IllegalArgumentException("Key and value cannot be null");
+        }
+        
+        lock.writeLock().lock();  // Exclusive write
+        try {
+            CacheEntry<V> entry = new CacheEntry<>(value, ttlMs);
+            cache.put(key, entry);  // LinkedHashMap handles LRU
+            System.out.println("Put: " + key + " (TTL: " + ttlMs + "ms, size: " + cache.size() + ")");
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+    
+    public V get(K key) {
+        lock.readLock().lock();  // Multiple readers OK
+        try {
+            CacheEntry<V> entry = cache.get(key);
+            
+            if (entry == null) {
+                misses.incrementAndGet();
+                return null;
+            }
+            
+            if (entry.isExpired()) {
+                misses.incrementAndGet();
+                
+                // Need write lock to remove
+                lock.readLock().unlock();
+                lock.writeLock().lock();
+                try {
+                    // Double-check after acquiring write lock
+                    entry = cache.get(key);
+                    if (entry != null && entry.isExpired()) {
+                        cache.remove(key);
+                        evictions.incrementAndGet();
+                        System.out.println("Get: " + key + " - EXPIRED");
+                    }
+                    return null;
+                } finally {
+                    lock.readLock().lock();
+                    lock.writeLock().unlock();
+                }
+            }
+            
+            hits.incrementAndGet();
+            return entry.value;
+            
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+    
+    public void remove(K key) {
+        lock.writeLock().lock();
+        try {
+            if (cache.remove(key) != null) {
+                System.out.println("Removed: " + key);
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+    
+    private void cleanupExpired() {
+        lock.writeLock().lock();
+        try {
+            Iterator<Map.Entry<K, CacheEntry<V>>> iterator = cache.entrySet().iterator();
+            int cleaned = 0;
+            
+            while (iterator.hasNext()) {
+                Map.Entry<K, CacheEntry<V>> entry = iterator.next();
+                if (entry.getValue().isExpired()) {
+                    iterator.remove();
+                    cleaned++;
+                    evictions.incrementAndGet();
+                }
+            }
+            
+            if (cleaned > 0) {
+                System.out.println("Cleanup: removed " + cleaned + " expired entries");
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+    
+    public void shutdown() {
+        cleaner.shutdown();
+    }
+    
+    public Map<String, Long> getStatistics() {
+        lock.readLock().lock();
+        try {
+            Map<String, Long> stats = new HashMap<>();
+            stats.put("size", (long) cache.size());
+            stats.put("hits", hits.get());
+            stats.put("misses", misses.get());
+            stats.put("evictions", evictions.get());
+            
+            long total = hits.get() + misses.get();
+            stats.put("hitRate", total == 0 ? 0 : (hits.get() * 100 / total));
+            
+            return stats;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+    
+    // Test
+    public static void main(String[] args) throws InterruptedException {
+        TTLCacheV2<String, String> cache = new TTLCacheV2<>(3, 2000);
+        
+        // Test size eviction
+        System.out.println("\n=== Test Size Eviction ===");
+        cache.put("key1", "value1");
+        cache.put("key2", "value2");
+        cache.put("key3", "value3");
+        cache.put("key4", "value4");  // Should evict key1
+        
+        System.out.println("key1: " + cache.get("key1"));  // null (evicted)
+        System.out.println("key2: " + cache.get("key2"));  // value2
+        
+        // Test TTL expiry
+        System.out.println("\n=== Test TTL Expiry ===");
+        cache.put("temp", "temporary", 1000);  // 1 second TTL
+        System.out.println("temp (immediate): " + cache.get("temp"));  // temporary
+        Thread.sleep(1500);
+        System.out.println("temp (after 1.5s): " + cache.get("temp"));  // null (expired)
+        
+        // Test LRU
+        System.out.println("\n=== Test LRU ===");
+        cache.put("a", "valueA");
+        cache.put("b", "valueB");
+        cache.put("c", "valueC");
+        cache.get("a");  // Access 'a', making it recently used
+        cache.put("d", "valueD");  // Should evict 'b' (least recently used)
+        
+        System.out.println("a: " + cache.get("a"));  // valueA (accessed recently)
+        System.out.println("b: " + cache.get("b"));  // null (evicted)
+        System.out.println("c: " + cache.get("c"));  // valueC
+        
+        Thread.sleep(3000);
+        
+        System.out.println("\n=== Statistics ===");
+        cache.getStatistics().forEach((key, value) -> 
+            System.out.println(key + ": " + value));
+        
+        cache.shutdown();
+    }
+}
+```
+
+---
+
+## Pitfalls and Edge Cases
+
+**Me**: "Key gotchas to watch for:
+
+### Pitfall 1: Lock Upgrade Deadlock
+
+```java
+// ❌ WRONG - Can deadlock!
+lock.readLock().lock();
+try {
+    if (entry.isExpired()) {
+        lock.readLock().unlock();
+        lock.writeLock().lock();  // Deadlock if multiple readers try this!
+        try {
+            cache.remove(key);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+} finally {
+    lock.readLock().unlock();  // Might be already unlocked!
+}
+
+// ✓ CORRECT - Careful lock management
+lock.readLock().lock();
+try {
+    if (entry.isExpired()) {
+        // Release read lock BEFORE acquiring write lock
+        lock.readLock().unlock();
+        lock.writeLock().lock();
+        try {
+            // Double-check after acquiring write lock
+            entry = cache.get(key);
+            if (entry != null && entry.isExpired()) {
+                cache.remove(key);
+            }
+        } finally {
+            // Downgrade: acquire read lock before releasing write lock
+            lock.readLock().lock();
+            lock.writeLock().unlock();
+        }
+    }
+} finally {
+    lock.readLock().unlock();
+}
+```
+
+### Pitfall 2: Time-of-Check Time-of-Use (TOCTOU)
+
+```java
+// ❌ WRONG - Race condition
+if (!entry.isExpired()) {  // Check
+    return entry.value;     // Use (might be expired now!)
+}
+
+// ✓ CORRECT - Atomic check-and-use
+lock.writeLock().lock();
+try {
+    if (entry.isExpired()) {
+        cache.remove(key);
+        return null;
+    }
+    return entry.value;
+} finally {
+    lock.writeLock().unlock();
+}
+```
+
+### Pitfall 3: Cleanup Thread Holding Write Lock Too Long
+
+```java
+// ❌ WRONG - Blocks all readers during cleanup
+lock.writeLock().lock();
+try {
+    for (Map.Entry<K, CacheEntry<V>> entry : cache.entrySet()) {
+        if (entry.getValue().isExpired()) {
+            cache.remove(entry.getKey());  // Modifies during iteration!
+        }
+    }
+} finally {
+    lock.writeLock().unlock();
+}
+
+// ✓ CORRECT - Use iterator for safe removal
+lock.writeLock().lock();
+try {
+    Iterator<Map.Entry<K, CacheEntry<V>>> iterator = cache.entrySet().iterator();
+    while (iterator.hasNext()) {
+        if (iterator.next().getValue().isExpired()) {
+            iterator.remove();  // Safe removal
+        }
+    }
+} finally {
+    lock.writeLock().unlock();
+}
+```
+
+### Pitfall 4: Memory Leak with Weak References
+
+```java
+// Problem: Entries never cleaned up if not accessed
+cache.put("key", hugeObject, Long.MAX_VALUE);  // Never expires
+// If key never accessed again, hugeObject stays in memory forever!
+
+// Solution: Maximum TTL or periodic full cleanup
+private static final long MAX_TTL = TimeUnit.DAYS.toMillis(7);
+
+public void put(K key, V value, long ttlMs) {
+    long actualTtl = Math.min(ttlMs, MAX_TTL);
+    // ...
+}
+```
+
+### Pitfall 5: LinkedHashMap Removes During Iteration
+
+```java
+// ❌ WRONG - ConcurrentModificationException possible
+for (Map.Entry<K, CacheEntry<V>> entry : cache.entrySet()) {
+    if (entry.getValue().isExpired()) {
+        cache.remove(entry.getKey());  // Modifies map during iteration!
+    }
+}
+
+// ✓ CORRECT - Use iterator
+Iterator<Map.Entry<K, CacheEntry<V>>> iterator = cache.entrySet().iterator();
+while (iterator.hasNext()) {
+    if (iterator.next().getValue().isExpired()) {
+        iterator.remove();  // Safe
+    }
+}
+```
+
+### Pitfall 6: StampedLock for Optimistic Reads (Advanced)
+
+```java
+// Better performance for read-heavy workloads
+private final StampedLock stampedLock = new StampedLock();
+
+public V get(K key) {
+    long stamp = stampedLock.tryOptimisticRead();  // Optimistic, no lock!
+    CacheEntry<V> entry = cache.get(key);
+    
+    if (!stampedLock.validate(stamp)) {  // Check if write occurred
+        // Validation failed, fall back to read lock
+        stamp = stampedLock.readLock();
+        try {
+            entry = cache.get(key);
+        } finally {
+            stampedLock.unlockRead(stamp);
+        }
+    }
+    
+    // Process entry...
+}
+```
+"
+
+---
+
+## Lock-Free Optimization
+
+**Me**: "Can we make this lock-free?
+
+### Challenge: LRU Ordering Requires Coordination
+
+LRU needs to track access order, which requires some form of synchronization.
+
+### Option 1: Approximate LRU with ConcurrentHashMap
+
+Already shown in Approach 1 - uses `ConcurrentLinkedQueue` for approximate LRU.
+
+**Trade-offs**:
+- ✓ No lock contention
+- ✗ Not perfect LRU (duplicates in queue)
+- ✗ More memory overhead
+
+### Option 2: Segment-Based (Caffeine Cache Approach)
+
+```java
+public class SegmentedCache<K, V> {
+    
+    private static final int SEGMENTS = 16;
+    private final TTLCacheV2<K, V>[] segments;
+    
+    @SuppressWarnings("unchecked")
+    public SegmentedCache(int totalSize, long ttl) {
+        segments = new TTLCacheV2[SEGMENTS];
+        int sizePerSegment = totalSize / SEGMENTS;
+        
+        for (int i = 0; i < SEGMENTS; i++) {
+            segments[i] = new TTLCacheV2<>(sizePerSegment, ttl);
+        }
+    }
+    
+    private int segmentFor(K key) {
+        return Math.abs(key.hashCode()) % SEGMENTS;
+    }
+    
+    public void put(K key, V value) {
+        segments[segmentFor(key)].put(key, value);
+    }
+    
+    public V get(K key) {
+        return segments[segmentFor(key)].get(key);
+    }
+}
+```
+
+**Benefits**:
+- Reduces lock contention (16× less)
+- Each segment has its own lock
+- Different keys likely in different segments
+
+### Option 3: W-TinyLFU (Caffeine's Approach)
+
+Too complex for interview, but concept:
+- Use bloom filter for frequency tracking
+- Separate windows for recent vs frequent items
+- Lock-free frequency counting with `LongAdder`
+
+### Recommendation
+
+**For interview**: 
+1. Start with ReadWriteLock + LinkedHashMap (Approach 2)
+2. Mention ConcurrentHashMap for lock-free reads
+3. Discuss segmentation if asked about optimization
+4. Reference Caffeine or Guava for production use
+
+**Why locks are OK here**:
+- Read lock doesn't block other readers
+- Write operations are infrequent (compared to reads)
+- LRU ordering requires some coordination anyway
+"
+
+---
+
+## Interview Follow-Up Questions
+
+**Q1: How would you handle cache warming?**
+
+```java
+public void warmUp(Map<K, V> initialData) {
+    lock.writeLock().lock();
+    try {
+        for (Map.Entry<K, V> entry : initialData.entrySet()) {
+            cache.put(entry.getKey(), 
+                new CacheEntry<>(entry.getValue(), defaultTtlMs));
+        }
+        System.out.println("Cache warmed with " + initialData.size() + " entries");
+    } finally {
+        lock.writeLock().unlock();
+    }
+}
+```
+
+**Q2: How to implement cache-aside pattern?**
+
+```java
+public V getOrLoad(K key, Function<K, V> loader) {
+    V value = get(key);
+    if (value != null) {
+        return value;  // Cache hit
+    }
+    
+    // Cache miss - load from source
+    value = loader.apply(key);
+    if (value != null) {
+        put(key, value);
+    }
+    return value;
+}
+
+// Problem: Multiple threads might load simultaneously!
+// Better: Use computeIfAbsent pattern
+public V getOrLoad(K key, Function<K, V> loader) {
+    lock.writeLock().lock();
+    try {
+        CacheEntry<V> entry = cache.get(key);
+        if (entry != null && !entry.isExpired()) {
+            return entry.value;
+        }
+        
+        // Load while holding lock (only one thread loads)
+        V value = loader.apply(key);
+        if (value != null) {
+            cache.put(key, new CacheEntry<>(value, defaultTtlMs));
+        }
+        return value;
+    } finally {
+        lock.writeLock().unlock();
+    }
+}
+```
+
+**Q3: How to test expiry?**
+
+```java
+@Test
+public void testExpiry() throws InterruptedException {
+    TTLCacheV2<String, String> cache = new TTLCacheV2<>(10, 1000);
+    
+    cache.put("key", "value", 500);  // 500ms TTL
+    
+    assertEquals("value", cache.get("key"));  // Immediate: present
+    
+    Thread.sleep(600);  // Wait for expiry
+    
+    assertNull(cache.get("key"));  // After expiry: null
+}
+
+@Test
+public void testLRU() {
+    TTLCacheV2<String, String> cache = new TTLCacheV2<>(2, 10000);
+    
+    cache.put("key1", "value1");
+    cache.put("key2", "value2");
+    cache.get("key1");  // Access key1
+    cache.put("key3", "value3");  // Should evict key2 (LRU)
+    
+    assertNotNull(cache.get("key1"));
+    assertNull(cache.get("key2"));  // Evicted
+    assertNotNull(cache.get("key3"));
+}
+```
+
+---
