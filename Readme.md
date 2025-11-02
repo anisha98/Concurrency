@@ -8729,4 +8729,2176 @@ public class SlidingWindowCounter {
 - Automatically expires old data
 - Lock-free increments (LongAdder per bucket)
 "
+# Remaining Concurrency Design Problems - Part 4
 
+---
+
+# Producer-Consumer with Multiple Queues
+
+## Problem Introduction
+
+**Interviewer**: "Design a producer-consumer system with multiple queues. Tasks should be routed to different queues based on priority or type, and multiple consumers process from these queues."
+
+**Me**: "Interesting! Let me clarify:
+
+**Scenario**:
+```
+Producers → [High Priority Queue]   → Consumer Pool 1
+         → [Medium Priority Queue] → Consumer Pool 2
+         → [Low Priority Queue]    → Consumer Pool 3
+
+Or:
+
+Producers → Route by type → [Queue-A] → Consumers
+                          → [Queue-B] → Consumers
+                          → [Queue-C] → Consumers
+```
+
+**Questions**:
+1. **Routing strategy**: Priority-based, type-based, or round-robin?
+2. **Consumer allocation**: Dedicated consumers per queue or shared pool?
+3. **Starvation**: How to prevent low-priority queue starvation?
+4. **Load balancing**: Static or dynamic consumer allocation?
+5. **Ordering**: Preserve order within queue or globally?
+
+**Assumptions**:
+- Priority-based routing (high, medium, low)
+- Shared consumer pool with weighted consumption
+- Prevent starvation with fair scheduling
+- Dynamic load balancing
+- Order within priority level
+
+Sound good?"
+
+**Interviewer**: "Yes, focus on preventing starvation of low-priority tasks."
+
+---
+
+## High-Level Design
+
+**Me**: "Here's the architecture:
+
+### Structure:
+```
+┌──────────────────────────────────────────────┐
+│         Multi-Queue System                   │
+├──────────────────────────────────────────────┤
+│  High Priority Queue [===]   (weight: 70%)  │
+│  Med Priority Queue  [====]  (weight: 20%)  │
+│  Low Priority Queue  [=====] (weight: 10%)  │
+├──────────────────────────────────────────────┤
+│         Consumer Pool (shared)               │
+│  [Consumer-1] [Consumer-2] ... [Consumer-N] │
+└──────────────────────────────────────────────┘
+```
+
+### Fair Consumption Strategy:
+```
+Out of 10 tasks consumed:
+- 7 from high priority (70%)
+- 2 from medium priority (20%)
+- 1 from low priority (10%)
+
+Even if high priority queue has 1000 tasks,
+low priority still gets processed!
+```
+
+### Key Design:
+- Weighted round-robin selection
+- BlockingQueue for each priority
+- Shared consumer pool"
+
+---
+
+## Implementation
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class MultiQueueProcessor<T> {
+    
+    enum Priority {
+        HIGH(70),    // 70% of consumption
+        MEDIUM(20),  // 20% of consumption
+        LOW(10);     // 10% of consumption
+        
+        final int weight;
+        Priority(int weight) { this.weight = weight; }
+    }
+    
+    static class Task<T> {
+        final T data;
+        final Priority priority;
+        
+        Task(T data, Priority priority) {
+            this.data = data;
+            this.priority = priority;
+        }
+    }
+    
+    private final Map<Priority, BlockingQueue<Task<T>>> queues;
+    private final ExecutorService consumers;
+    private final int numConsumers;
+    private volatile boolean shutdown = false;
+    
+    // Task processor
+    private final java.util.function.Consumer<T> processor;
+    
+    // Statistics per priority
+    private final Map<Priority, AtomicLong> processedCount;
+    private final Map<Priority, AtomicLong> queuedCount;
+    
+    public MultiQueueProcessor(int numConsumers, 
+                               int queueSize,
+                               java.util.function.Consumer<T> processor) {
+        this.numConsumers = numConsumers;
+        this.processor = processor;
+        
+        // Initialize queues for each priority
+        this.queues = new EnumMap<>(Priority.class);
+        this.processedCount = new EnumMap<>(Priority.class);
+        this.queuedCount = new EnumMap<>(Priority.class);
+        
+        for (Priority p : Priority.values()) {
+            queues.put(p, new ArrayBlockingQueue<>(queueSize));
+            processedCount.put(p, new AtomicLong(0));
+            queuedCount.put(p, new AtomicLong(0));
+        }
+        
+        // Start consumers
+        this.consumers = Executors.newFixedThreadPool(numConsumers);
+        for (int i = 0; i < numConsumers; i++) {
+            consumers.submit(new Consumer(i));
+        }
+        
+        System.out.println("Multi-queue processor started with " + 
+            numConsumers + " consumers");
+    }
+    
+    /**
+     * Submit task with priority
+     */
+    public void submit(T data, Priority priority) throws InterruptedException {
+        if (shutdown) {
+            throw new IllegalStateException("Processor is shut down");
+        }
+        
+        Task<T> task = new Task<>(data, priority);
+        queues.get(priority).put(task);
+        queuedCount.get(priority).incrementAndGet();
+        
+        System.out.println(Thread.currentThread().getName() + 
+            " submitted " + priority + " priority task (queue size: " + 
+            queues.get(priority).size() + ")");
+    }
+    
+    /**
+     * Consumer that uses weighted selection
+     */
+    class Consumer implements Runnable {
+        private final int id;
+        private final Random random = new Random();
+        
+        Consumer(int id) {
+            this.id = id;
+        }
+        
+        @Override
+        public void run() {
+            System.out.println("Consumer-" + id + " started");
+            
+            while (!shutdown) {
+                try {
+                    // Select queue based on weighted probability
+                    Priority priority = selectQueueWeighted();
+                    
+                    // Try to get task from selected queue
+                    Task<T> task = queues.get(priority).poll(100, TimeUnit.MILLISECONDS);
+                    
+                    if (task != null) {
+                        System.out.println("Consumer-" + id + 
+                            " processing " + task.priority + " task");
+                        
+                        processor.accept(task.data);
+                        processedCount.get(task.priority).incrementAndGet();
+                    }
+                    
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    System.err.println("Consumer-" + id + " error: " + e.getMessage());
+                }
+            }
+            
+            System.out.println("Consumer-" + id + " stopped");
+        }
+        
+        /**
+         * Weighted random selection
+         */
+        private Priority selectQueueWeighted() {
+            int rand = random.nextInt(100);
+            
+            // 0-69: HIGH (70%)
+            if (rand < 70) {
+                return Priority.HIGH;
+            }
+            // 70-89: MEDIUM (20%)
+            else if (rand < 90) {
+                return Priority.MEDIUM;
+            }
+            // 90-99: LOW (10%)
+            else {
+                return Priority.LOW;
+            }
+        }
+    }
+    
+    /**
+     * Alternative: Round-robin with skip empty
+     */
+    class FairConsumer implements Runnable {
+        private final int id;
+        private int currentPriorityIndex = 0;
+        private final Priority[] priorities = Priority.values();
+        
+        @Override
+        public void run() {
+            while (!shutdown) {
+                try {
+                    // Try each queue in round-robin
+                    boolean foundTask = false;
+                    
+                    for (int i = 0; i < priorities.length; i++) {
+                        Priority p = priorities[currentPriorityIndex];
+                        currentPriorityIndex = (currentPriorityIndex + 1) % priorities.length;
+                        
+                        Task<T> task = queues.get(p).poll(10, TimeUnit.MILLISECONDS);
+                        
+                        if (task != null) {
+                            processor.accept(task.data);
+                            processedCount.get(p).incrementAndGet();
+                            foundTask = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!foundTask) {
+                        Thread.sleep(10);  // All queues empty
+                    }
+                    
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+    }
+    
+    public void shutdown() throws InterruptedException {
+        shutdown = true;
+        consumers.shutdown();
+        consumers.awaitTermination(10, TimeUnit.SECONDS);
+        
+        System.out.println("\n=== Shutdown Complete ===");
+        printStatistics();
+    }
+    
+    public void printStatistics() {
+        System.out.println("\nStatistics:");
+        for (Priority p : Priority.values()) {
+            long queued = queuedCount.get(p).get();
+            long processed = processedCount.get(p).get();
+            int remaining = queues.get(p).size();
+            
+            System.out.printf("%s: queued=%d, processed=%d, remaining=%d\n",
+                p, queued, processed, remaining);
+        }
+    }
+    
+    // Test
+    public static void main(String[] args) throws InterruptedException {
+        MultiQueueProcessor<String> processor = new MultiQueueProcessor<>(
+            3,      // 3 consumers
+            100,    // Queue size
+            data -> {
+                try {
+                    Thread.sleep(50);  // Simulate processing
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        );
+        
+        // Submit tasks with different priorities
+        ExecutorService producers = Executors.newFixedThreadPool(5);
+        
+        for (int i = 0; i < 5; i++) {
+            final int producerId = i;
+            producers.submit(() -> {
+                try {
+                    for (int j = 0; j < 20; j++) {
+                        Priority p;
+                        if (j % 10 == 0) {
+                            p = Priority.LOW;
+                        } else if (j % 3 == 0) {
+                            p = Priority.MEDIUM;
+                        } else {
+                            p = Priority.HIGH;
+                        }
+                        
+                        processor.submit("task-" + producerId + "-" + j, p);
+                        Thread.sleep(10);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+        
+        producers.shutdown();
+        producers.awaitTermination(30, TimeUnit.SECONDS);
+        
+        Thread.sleep(5000);  // Let consumers finish
+        
+        processor.shutdown();
+    }
+}
+```
+
+---
+
+## Pitfalls and Edge Cases
+
+**Me**: "Key gotchas:
+
+### Pitfall 1: Starvation of Low Priority
+
+```java
+// ❌ WRONG - Always check high priority first
+Task task = highQueue.poll();
+if (task == null) {
+    task = mediumQueue.poll();
+}
+if (task == null) {
+    task = lowQueue.poll();
+}
+
+// If high queue always has tasks, low queue never processed!
+
+// ✓ CORRECT - Weighted selection or round-robin
+Priority selected = selectWithWeight();
+Task task = queues.get(selected).poll();
+```
+
+### Pitfall 2: Inefficient Weighted Selection
+
+```java
+// ❌ WRONG - Check each queue every time
+for (int i = 0; i < 7; i++) {
+    task = highQueue.poll();
+    if (task != null) process(task);
+}
+for (int i = 0; i < 2; i++) {
+    task = mediumQueue.poll();
+    if (task != null) process(task);
+}
+// Complex, inefficient
+
+// ✓ CORRECT - Random weighted selection
+int rand = random.nextInt(100);
+if (rand < 70) return HIGH;
+else if (rand < 90) return MEDIUM;
+else return LOW;
+```
+
+### Pitfall 3: Unbounded Queue Growth
+
+```java
+// Problem: High priority queue fills up, producers blocked
+// Meanwhile low priority queue is empty
+
+// Solution: Cross-queue load balancing
+public void submit(T data, Priority priority) throws InterruptedException {
+    BlockingQueue<Task<T>> queue = queues.get(priority);
+    
+    if (!queue.offer(data)) {
+        // Queue full, try lower priority
+        Priority lowerPriority = priority.lower();
+        if (lowerPriority != null) {
+            queues.get(lowerPriority).put(data);
+            System.out.println("Downgraded task from " + priority + 
+                " to " + lowerPriority);
+        } else {
+            queue.put(data);  // Block on lowest queue
+        }
+    }
+}
+```
+
+### Pitfall 4: Work Stealing
+
+```java
+// Better approach: Work stealing
+class WorkStealingConsumer implements Runnable {
+    @Override
+    public void run() {
+        while (!shutdown) {
+            Task task = null;
+            
+            // Try own queue first
+            task = myQueue.poll();
+            
+            // If empty, steal from other queues
+            if (task == null) {
+                for (BlockingQueue<Task> otherQueue : allQueues) {
+                    task = otherQueue.poll();
+                    if (task != null) {
+                        System.out.println("Stole task from other queue");
+                        break;
+                    }
+                }
+            }
+            
+            if (task != null) {
+                process(task);
+            } else {
+                Thread.sleep(10);
+            }
+        }
+    }
+}
+```
+
+### Pitfall 5: Priority Inversion
+
+```java
+// Problem:
+High priority task needs result from low priority task
+Low priority task stuck behind many other low priority tasks
+High priority task waits!
+
+// Solution: Priority inheritance
+when high priority task waits on low priority task:
+    boost low priority task to high priority
+    process it immediately
+    restore original priority
+```
+
+### Pitfall 6: Thundering Herd on Queue Selection
+
+```java
+// ❌ WRONG - All consumers check same queue
+synchronized (queues) {
+    Priority p = selectQueue();
+    return queues.get(p).poll();
+}
+// Serializes queue selection!
+
+// ✓ CORRECT - Lock-free selection
+Priority p = selectQueueWeighted();  // No lock
+return queues.get(p).poll(100, TimeUnit.MILLISECONDS);
+```
+"
+
+---
+
+## Advanced: Dynamic Priority Adjustment
+
+**Me**: "Production systems often adjust priorities dynamically:
+
+```java
+public class AdaptiveMultiQueue<T> {
+    
+    static class QueueStats {
+        final AtomicLong size = new AtomicLong(0);
+        final AtomicLong processed = new AtomicLong(0);
+        final AtomicLong waitTime = new AtomicLong(0);
+        
+        double getAverageWaitTime() {
+            long p = processed.get();
+            return p == 0 ? 0 : waitTime.get() / (double) p;
+        }
+    }
+    
+    private final Map<Priority, QueueStats> stats;
+    
+    /**
+     * Adaptive weight calculation based on queue depth
+     */
+    private Priority selectQueueAdaptive() {
+        // If low priority queue is getting too deep, boost its weight
+        long lowSize = queues.get(Priority.LOW).size();
+        long highSize = queues.get(Priority.HIGH).size();
+        
+        if (lowSize > 100 && highSize < 10) {
+            // Temporarily boost low priority
+            return Priority.LOW;
+        }
+        
+        // Otherwise use normal weights
+        return selectQueueWeighted();
+    }
+    
+    /**
+     * Age-based priority boost
+     */
+    static class AgingTask<T> extends Task<T> {
+        final long submittedAt;
+        
+        AgingTask(T data, Priority priority) {
+            super(data, priority);
+            this.submittedAt = System.currentTimeMillis();
+        }
+        
+        Priority getEffectivePriority() {
+            long age = System.currentTimeMillis() - submittedAt;
+            
+            // After 5 seconds, boost priority
+            if (age > 5000 && priority == Priority.LOW) {
+                return Priority.MEDIUM;
+            }
+            if (age > 10000 && priority == Priority.MEDIUM) {
+                return Priority.HIGH;
+            }
+            
+            return priority;
+        }
+    }
+}
+```
+"
+
+---
+
+## Interview Follow-Up Questions
+
+**Q1: How would you implement work stealing between queues?**
+
+```java
+class WorkStealingConsumer implements Runnable {
+    private final List<BlockingQueue<Task>> allQueues;
+    private int preferredQueue;
+    
+    @Override
+    public void run() {
+        while (!shutdown) {
+            Task task = null;
+            
+            // Try preferred queue
+            task = allQueues.get(preferredQueue).poll();
+            
+            // Try stealing from others
+            if (task == null) {
+                for (int i = 0; i < allQueues.size(); i++) {
+                    if (i == preferredQueue) continue;
+                    
+                    task = allQueues.get(i).poll();
+                    if (task != null) {
+                        System.out.println("Stole from queue " + i);
+                        break;
+                    }
+                }
+            }
+            
+            if (task != null) {
+                process(task);
+            }
+        }
+    }
+}
+```
+
+**Q2: How to monitor and alert on starvation?**
+
+```java
+class StarvationMonitor {
+    private final ScheduledExecutorService monitor;
+    
+    public StarvationMonitor() {
+        this.monitor = Executors.newSingleThreadScheduledExecutor();
+        
+        monitor.scheduleAtFixedRate(() -> {
+            for (Priority p : Priority.values()) {
+                QueueStats stats = queueStats.get(p);
+                
+                double avgWaitTime = stats.getAverageWaitTime();
+                int queueSize = queues.get(p).size();
+                
+                // Alert if low priority queue is starving
+                if (p == Priority.LOW && avgWaitTime > 5000) {
+                    System.err.println("ALERT: Low priority queue starving! " +
+                        "Avg wait: " + avgWaitTime + "ms, size: " + queueSize);
+                }
+            }
+        }, 10, 10, TimeUnit.SECONDS);
+    }
+}
+```
+
+---
+
+# Concurrent Data Deduplicator
+
+## Problem Introduction
+
+**Interviewer**: "Design a deduplicator that processes a stream of data and ensures each unique item is processed only once, even with concurrent threads submitting items."
+
+**Me**: "Interesting! Let me clarify:
+
+**Scenario**:
+```
+Stream of events:
+E1, E2, E1 (duplicate), E3, E2 (duplicate), E4
+
+Output:
+E1 → processed
+E2 → processed
+E1 → skipped (duplicate)
+E3 → processed
+E2 → skipped (duplicate)
+E4 → processed
+```
+
+**Questions**:
+1. **Deduplication scope**: All-time or within time window?
+2. **Identity**: By hash, by field, or custom equals?
+3. **Scale**: Millions or billions of unique items?
+4. **Memory**: Unbounded or need eviction?
+5. **Processing**: Sync or async after dedup?
+
+**Assumptions**:
+- Time-window based (last 1 hour)
+- By object equality
+- Millions of items
+- LRU eviction if memory limit
+- Sync processing (return immediately)
+
+Sound good?"
+
+**Interviewer**: "Yes, focus on efficient concurrent deduplication."
+
+---
+
+## High-Level Design
+
+**Me**: "Here's the architecture:
+
+### Simple Approach:
+```
+Deduplicator
+├── ConcurrentHashMap<Item, Timestamp> (seen items)
+├── Process if new
+└── Periodic cleanup of old entries
+```
+
+### For Scale (Billions):
+```
+Deduplicator
+├── Bloom Filter (fast negative check)
+│   └── "Probably seen" or "definitely not seen"
+├── ConcurrentHashMap (precise check)
+└── Time-based eviction
+```
+
+### Key Optimization:
+Use `ConcurrentHashMap.newKeySet()` - perfect for deduplication!"
+
+---
+
+## Implementation: Basic Deduplicator
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.function.*;
+
+public class Deduplicator<T> {
+    
+    // Seen items with timestamp
+    static class SeenEntry {
+        final long timestamp;
+        
+        SeenEntry() {
+            this.timestamp = System.currentTimeMillis();
+        }
+        
+        boolean isExpired(long ttlMs) {
+            return System.currentTimeMillis() - timestamp > ttlMs;
+        }
+    }
+    
+    private final ConcurrentHashMap<T, SeenEntry> seenItems;
+    private final long deduplicationWindowMs;
+    private final Consumer<T> processor;
+    
+    // Cleanup
+    private final ScheduledExecutorService cleaner;
+    
+    // Statistics
+    private final AtomicLong processed = new AtomicLong(0);
+    private final AtomicLong duplicates = new AtomicLong(0);
+    private final AtomicLong expired = new AtomicLong(0);
+    
+    public Deduplicator(long deduplicationWindowMs, Consumer<T> processor) {
+        this.seenItems = new ConcurrentHashMap<>();
+        this.deduplicationWindowMs = deduplicationWindowMs;
+        this.processor = processor;
+        
+        // Periodic cleanup
+        this.cleaner = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "DedupCleaner");
+            t.setDaemon(true);
+            return t;
+        });
+        
+        long cleanupInterval = Math.max(deduplicationWindowMs / 10, 1000);
+        cleaner.scheduleAtFixedRate(
+            this::cleanupExpired,
+            cleanupInterval,
+            cleanupInterval,
+            TimeUnit.MILLISECONDS
+        );
+    }
+    
+    /**
+     * Process item if not seen before
+     */
+    public boolean processIfNew(T item) {
+        if (item == null) {
+            throw new IllegalArgumentException("Item cannot be null");
+        }
+        
+        // Try to add to seen set
+        SeenEntry existing = seenItems.putIfAbsent(item, new SeenEntry());
+        
+        if (existing != null) {
+            // Already seen
+            if (existing.isExpired(deduplicationWindowMs)) {
+                // Expired, allow reprocessing
+                seenItems.put(item, new SeenEntry());  // Update timestamp
+                System.out.println(Thread.currentThread().getName() + 
+                    " - Item reprocessed (expired): " + item);
+                processor.accept(item);
+                processed.incrementAndGet();
+                expired.incrementAndGet();
+                return true;
+            } else {
+                // Duplicate within window
+                System.out.println(Thread.currentThread().getName() + 
+                    " - DUPLICATE: " + item);
+                duplicates.incrementAndGet();
+                return false;
+            }
+        }
+        
+        // New item, process it
+        System.out.println(Thread.currentThread().getName() + 
+            " - Processing NEW item: " + item);
+        processor.accept(item);
+        processed.incrementAndGet();
+        return true;
+    }
+    
+    /**
+     * Check if item is duplicate without processing
+     */
+    public boolean isDuplicate(T item) {
+        SeenEntry entry = seenItems.get(item);
+        return entry != null && !entry.isExpired(deduplicationWindowMs);
+    }
+    
+    private void cleanupExpired() {
+        long now = System.currentTimeMillis();
+        int cleaned = 0;
+        
+        Iterator<Map.Entry<T, SeenEntry>> iterator = seenItems.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<T, SeenEntry> entry = iterator.next();
+            
+            if (now - entry.getValue().timestamp > deduplicationWindowMs) {
+                iterator.remove();
+                cleaned++;
+            }
+        }
+        
+        if (cleaned > 0) {
+            System.out.println("Cleanup: removed " + cleaned + " expired entries");
+        }
+    }
+    
+    public void shutdown() {
+        cleaner.shutdown();
+    }
+    
+    public Map<String, Long> getStatistics() {
+        Map<String, Long> stats = new HashMap<>();
+        stats.put("seenItems", (long) seenItems.size());
+        stats.put("processed", processed.get());
+        stats.put("duplicates", duplicates.get());
+        stats.put("expired", expired.get());
+        
+        long total = processed.get() + duplicates.get();
+        stats.put("deduplicationRate", total == 0 ? 0 : (duplicates.get() * 100 / total));
+        
+        return stats;
+    }
+    
+    // Test
+    public static void main(String[] args) throws InterruptedException {
+        Deduplicator<String> dedup = new Deduplicator<>(
+            5000,  // 5 second window
+            item -> System.out.println("  >>> PROCESSED: " + item)
+        );
+        
+        System.out.println("=== Test 1: Basic Deduplication ===");
+        dedup.processIfNew("item1");
+        dedup.processIfNew("item2");
+        dedup.processIfNew("item1");  // Duplicate
+        dedup.processIfNew("item3");
+        dedup.processIfNew("item2");  // Duplicate
+        
+        System.out.println("\n=== Test 2: Expiry ===");
+        dedup.processIfNew("temp");
+        Thread.sleep(6000);  // Wait for expiry
+        dedup.processIfNew("temp");  // Should process again (expired)
+        
+        System.out.println("\n=== Test 3: Concurrent Submissions ===");
+        ExecutorService executor = Executors.newFixedThreadPool(5);
+        CountDownLatch latch = new CountDownLatch(5);
+        
+        for (int i = 0; i < 5; i++) {
+            executor.submit(() -> {
+                try {
+                    for (int j = 0; j < 10; j++) {
+                        dedup.processIfNew("shared-item-" + (j % 5));
+                        Thread.sleep(10);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+        
+        latch.await();
+        executor.shutdown();
+        
+        System.out.println("\n=== Statistics ===");
+        dedup.getStatistics().forEach((key, value) -> 
+            System.out.println(key + ": " + value));
+        
+        dedup.shutdown();
+    }
+}
+```
+
+---
+
+## Advanced: Bloom Filter for Scale
+
+**Me**: "For billions of items, use Bloom filter:
+
+```java
+import com.google.common.hash.BloomFilter;
+import com.google.common.hash.Funnels;
+
+public class ScalableDeduplicator<T> {
+    
+    // Bloom filter for fast negative check
+    private final BloomFilter<T> bloomFilter;
+    
+    // Precise set for positive confirmation
+    private final ConcurrentHashMap<T, SeenEntry> seenItems;
+    
+    // Configuration
+    private final int maxSize;
+    private final double falsePositiveRate;
+    
+    public ScalableDeduplicator(int expectedItems, double falsePositiveRate) {
+        this.maxSize = expectedItems;
+        this.falsePositiveRate = falsePositiveRate;
+        
+        // Create bloom filter
+        this.bloomFilter = BloomFilter.create(
+            Funnels.byteArrayFunnel(),
+            expectedItems,
+            falsePositiveRate
+        );
+        
+        this.seenItems = new ConcurrentHashMap<>();
+    }
+    
+    public boolean processIfNew(T item) {
+        // Fast check: Bloom filter (lock-free read)
+        if (!bloomFilter.mightContain(item)) {
+            // Definitely not seen before
+            bloomFilter.put(item);
+            seenItems.put(item, new SeenEntry());
+            processor.accept(item);
+            return true;
+        }
+        
+        // Might have seen it, check precise set
+        SeenEntry existing = seenItems.putIfAbsent(item, new SeenEntry());
+        
+        if (existing != null) {
+            // Confirmed duplicate
+            return false;
+        }
+        
+        // False positive from bloom filter, but actually new
+        processor.accept(item);
+        return true;
+    }
+}
+```
+
+**Bloom Filter Benefits**:
+```
+1 billion items:
+
+Without Bloom Filter:
+- Memory: 1B × (object overhead + timestamp) ≈ 20GB
+- Check time: HashMap lookup ≈ 100ns
+
+With Bloom Filter (1% false positive):
+- Memory: ~1.2GB (bloom filter) + 20GB (hash map) = 21.2GB
+- Check time: 
+  - New item: Bloom check ≈ 50ns (skip HashMap!)
+  - Duplicate: Bloom + HashMap ≈ 150ns
+
+If 90% are duplicates:
+- 90% fast path (bloom only): 50ns
+- 10% slow path (bloom + hash): 150ns
+- Average: 60ns vs 100ns
+- 1.6× faster + early rejection
+```
+
+**Trade-off**:
+- ✓ Fast rejection of new items
+- ✓ Lower memory if most items are new
+- ✗ False positives (need HashMap anyway)
+- ✗ Additional complexity
+"
+
+---
+
+# Multi-Level Cache
+
+## Problem Introduction
+
+**Interviewer**: "Design a multi-level cache system with L1 (thread-local), L2 (shared in-memory), and L3 (distributed/remote) caches."
+
+**Me**: "Classic cache hierarchy! Let me clarify:
+
+**Structure**:
+```
+Request → L1 (thread-local) → hit? Return
+       → L2 (shared memory) → hit? Promote to L1, return
+       → L3 (Redis/remote) → hit? Promote to L2, return
+       → Database → Store in all levels, return
+
+Example latencies:
+L1: 10ns (local variable)
+L2: 100ns (ConcurrentHashMap)
+L3: 1ms (network)
+DB: 10ms (disk + network)
+```
+
+**Questions**:
+1. **Promotion**: Always promote or conditional?
+2. **Invalidation**: How to sync across levels?
+3. **Size limits**: Per-level limits?
+4. **Consistency**: Strong or eventual?
+5. **Write strategy**: Write-through or write-behind?
+
+**Assumptions**:
+- Always promote on hit
+- Invalidate all levels on write
+- Different sizes per level (L1: 10, L2: 100, L3: 1000)
+- Eventual consistency
+- Write-through for simplicity
+
+Sound good?"
+
+**Interviewer**: "Yes, focus on the promotion and invalidation mechanisms."
+
+---
+
+## High-Level Design
+
+**Me**: "Here's the architecture:
+
+### Cache Hierarchy:
+```
+┌─────────────────────────────────────────┐
+│  L1: ThreadLocal<Map<K, V>>             │
+│  Size: 10-100 per thread                │
+│  Latency: ~10ns                         │
+└─────────────────────────────────────────┘
+            ↓ (miss)
+┌─────────────────────────────────────────┐
+│  L2: ConcurrentHashMap<K, V>            │
+│  Size: 1000-10000 (shared)              │
+│  Latency: ~100ns                        │
+└─────────────────────────────────────────┘
+            ↓ (miss)
+┌─────────────────────────────────────────┐
+│  L3: Remote Cache (Redis)               │
+│  Size: 100000+ (distributed)            │
+│  Latency: ~1ms                          │
+└─────────────────────────────────────────┘
+            ↓ (miss)
+┌─────────────────────────────────────────┐
+│  Database                               │
+│  Latency: ~10-100ms                     │
+└─────────────────────────────────────────┘
+```
+
+### Key Operations:
+1. **Get**: Check L1 → L2 → L3 → DB, promote on hit
+2. **Put**: Write to DB → Invalidate all levels
+3. **Invalidate**: Clear from all levels"
+
+---
+
+## Implementation
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class MultiLevelCache<K, V> {
+    
+    // L1: Thread-local cache (fastest)
+    private final ThreadLocal<Map<K, CacheEntry<V>>> l1Cache;
+    private final int l1MaxSize;
+    
+    // L2: Shared in-memory cache
+    private final ConcurrentHashMap<K, CacheEntry<V>> l2Cache;
+    private final int l2MaxSize;
+    
+    // L3: Remote cache interface
+    private final RemoteCache<K, V> l3Cache;
+    
+    // Database interface
+    private final Database<K, V> database;
+    
+    // TTL
+    private final long defaultTtlMs;
+    
+    // Statistics per level
+    private final AtomicLong l1Hits = new AtomicLong(0);
+    private final AtomicLong l2Hits = new AtomicLong(0);
+    private final AtomicLong l3Hits = new AtomicLong(0);
+    private final AtomicLong dbHits = new AtomicLong(0);
+    
+    static class CacheEntry<V> {
+        final V value;
+        final long expiryTime;
+        
+        CacheEntry(V value, long ttlMs) {
+            this.value = value;
+            this.expiryTime = System.currentTimeMillis() + ttlMs;
+        }
+        
+        boolean isExpired() {
+            return System.currentTimeMillis() > expiryTime;
+        }
+    }
+    
+    public interface RemoteCache<K, V> {
+        V get(K key);
+        void put(K key, V value, long ttlMs);
+        void remove(K key);
+    }
+    
+    public interface Database<K, V> {
+        V read(K key);
+        void write(K key, V value);
+        void delete(K key);
+    }
+    
+    public MultiLevelCache(int l1MaxSize, 
+                          int l2MaxSize,
+                          long defaultTtlMs,
+                          RemoteCache<K, V> l3Cache,
+                          Database<K, V> database) {
+        this.l1MaxSize = l1MaxSize;
+        this.l2MaxSize = l2MaxSize;
+        this.defaultTtlMs = defaultTtlMs;
+        this.l3Cache = l3Cache;
+        this.database = database;
+        
+        // Initialize L1 cache (per thread)
+        this.l1Cache = ThreadLocal.withInitial(() -> 
+            new LinkedHashMap<K, CacheEntry<V>>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<K, CacheEntry<V>> eldest) {
+                    return size() > l1MaxSize;
+                }
+            }
+        );
+        
+        // Initialize L2 cache
+        this.l2Cache = new ConcurrentHashMap<>();
+        
+        System.out.println("Multi-level cache initialized: L1=" + l1MaxSize + 
+            ", L2=" + l2MaxSize);
+    }
+    
+    /**
+     * Get value from cache hierarchy
+     */
+    public V get(K key) {
+        // L1: Thread-local (no synchronization!)
+        Map<K, CacheEntry<V>> l1 = l1Cache.get();
+        CacheEntry<V> entry = l1.get(key);
+        
+        if (entry != null && !entry.isExpired()) {
+            l1Hits.incrementAndGet();
+            System.out.println(Thread.currentThread().getName() + 
+                " - L1 HIT: " + key);
+            return entry.value;
+        }
+        
+        // L1 miss, try L2
+        entry = l2Cache.get(key);
+        if (entry != null && !entry.isExpired()) {
+            l2Hits.incrementAndGet();
+            System.out.println(Thread.currentThread().getName() + 
+                " - L2 HIT: " + key + " (promoting to L1)");
+            
+            // Promote to L1
+            l1.put(key, entry);
+            return entry.value;
+        }
+        
+        // L2 miss, try L3
+        V value = l3Cache.get(key);
+        if (value != null) {
+            l3Hits.incrementAndGet();
+            System.out.println(Thread.currentThread().getName() + 
+                " - L3 HIT: " + key + " (promoting to L2 and L1)");
+            
+            // Promote to L2 and L1
+            CacheEntry<V> newEntry = new CacheEntry<>(value, defaultTtlMs);
+            promoteToL2(key, newEntry);
+            l1.put(key, newEntry);
+            return value;
+        }
+        
+        // All cache misses, load from database
+        dbHits.incrementAndGet();
+        System.out.println(Thread.currentThread().getName() + 
+            " - DB HIT: " + key + " (loading and caching)");
+        
+        value = database.read(key);
+        if (value != null) {
+            // Store in all levels
+            CacheEntry<V> newEntry = new CacheEntry<>(value, defaultTtlMs);
+            l3Cache.put(key, value, defaultTtlMs);
+            promoteToL2(key, newEntry);
+            l1.put(key, newEntry);
+        }
+        
+        return value;
+    }
+    
+    /**
+     * Put value (write-through)
+     */
+    public void put(K key, V value) {
+        // Write to database first
+        database.write(key, value);
+        
+        // Invalidate all cache levels
+        invalidate(key);
+        
+        System.out.println("PUT: " + key + " (invalidated all levels)");
+    }
+    
+    /**
+     * Invalidate across all levels
+     */
+    public void invalidate(K key) {
+        // L1: Remove from current thread's cache
+        l1Cache.get().remove(key);
+        
+        // L2: Remove from shared cache
+        l2Cache.remove(key);
+        
+        // L3: Remove from remote cache
+        l3Cache.remove(key);
+        
+        System.out.println("INVALIDATE: " + key);
+    }
+    
+    /**
+     * Promote to L2 with size limit
+     */
+    private void promoteToL2(K key, CacheEntry<V> entry) {
+        // Check size limit
+        if (l2Cache.size() >= l2MaxSize) {
+            evictFromL2();
+        }
+        
+        l2Cache.put(key, entry);
+    }
+    
+    /**
+     * Evict from L2 (approximate LRU)
+     */
+    private void evictFromL2() {
+        // Find oldest entry (approximate)
+        K oldestKey = null;
+        long oldestTime = Long.MAX_VALUE;
+        
+        int sampled = 0;
+        for (Map.Entry<K, CacheEntry<V>> entry : l2Cache.entrySet()) {
+            if (entry.getValue().expiryTime < oldestTime) {
+                oldestTime = entry.getValue().expiryTime;
+                oldestKey = entry.getKey();
+            }
+            
+            if (++sampled > 10) break;  // Sample only 10 entries
+        }
+        
+        if (oldestKey != null) {
+            l2Cache.remove(oldestKey);
+        }
+    }
+    
+    public Map<String, Long> getStatistics() {
+        Map<String, Long> stats = new HashMap<>();
+        stats.put("l1Hits", l1Hits.get());
+        stats.put("l2Hits", l2Hits.get());
+        stats.put("l3Hits", l3Hits.get());
+        stats.put("dbHits", dbHits.get());
+        stats.put("l2Size", (long) l2Cache.size());
+        
+        long total = l1Hits.get() + l2Hits.get() + l3Hits.get() + dbHits.get();
+        stats.put("totalRequests", total);
+        
+        if (total > 0) {
+            stats.put("l1HitRate", l1Hits.get() * 100 / total);
+            stats.put("l2HitRate", (l1Hits.get() + l2Hits.get()) * 100 / total);
+            stats.put("overallHitRate", (total - dbHits.get()) * 100 / total);
+        }
+        
+        return stats;
+    }
+    
+    // Mock implementations for testing
+    static class MockRemoteCache<K, V> implements RemoteCache<K, V> {
+        private final ConcurrentHashMap<K, V> storage = new ConcurrentHashMap<>();
+        
+        @Override
+        public V get(K key) {
+            try {
+                Thread.sleep(1);  // Simulate network latency
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return storage.get(key);
+        }
+        
+        @Override
+        public void put(K key, V value, long ttlMs) {
+            storage.put(key, value);
+        }
+        
+        @Override
+        public void remove(K key) {
+            storage.remove(key);
+        }
+    }
+    
+    static class MockDatabase<K, V> implements Database<K, V> {
+        private final ConcurrentHashMap<K, V> storage = new ConcurrentHashMap<>();
+        
+        @Override
+        public V read(K key) {
+            try {
+                Thread.sleep(10);  // Simulate slow DB
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return storage.get(key);
+        }
+        
+        @Override
+        public void write(K key, V value) {
+            storage.put(key, value);
+        }
+        
+        @Override
+        public void delete(K key) {
+            storage.remove(key);
+        }
+    }
+    
+    // Test
+    public static void main(String[] args) throws InterruptedException {
+        MockRemoteCache<String, String> l3 = new MockRemoteCache<>();
+        MockDatabase<String, String> db = new MockDatabase<>();
+        
+        // Pre-populate database
+        db.write("key1", "value1");
+        db.write("key2", "value2");
+        db.write("key3", "value3");
+        
+        MultiLevelCache<String, String> cache = new MultiLevelCache<>(
+            5,      // L1 size
+            20,     // L2 size
+            60000,  // 1 minute TTL
+            l3,
+            db
+        );
+        
+        System.out.println("=== Test Cache Hierarchy ===\n");
+        
+        // First access: DB hit
+        System.out.println("First access:");
+        String v1 = cache.get("key1");
+        
+        // Second access: L1 hit (same thread)
+        System.out.println("\nSecond access (same thread):");
+        String v2 = cache.get("key1");
+        
+        // Third access: Different thread (L2 hit)
+        System.out.println("\nThird access (different thread):");
+        new Thread(() -> {
+            String v3 = cache.get("key1");
+            System.out.println("Got: " + v3);
+        }).start();
+        
+        Thread.sleep(100);
+        
+        // Write invalidates all levels
+        System.out.println("\nWrite operation:");
+        cache.put("key1", "newValue1");
+        
+        // Next read should be DB hit again
+        System.out.println("\nAfter invalidation:");
+        String v4 = cache.get("key1");
+        
+        Thread.sleep(100);
+        
+        System.out.println("\n=== Statistics ===");
+        cache.getStatistics().forEach((key, value) -> 
+            System.out.println(key + ": " + value));
+    }
+}
+```
+
+---
+
+## Pitfalls and Edge Cases
+
+**Me**: "Key gotchas:
+
+### Pitfall 1: Stale Reads After Invalidation
+
+```java
+// Problem:
+Thread-1: cache.put("key", "v2");  // Invalidates all
+Thread-2: (already read "v1" from L1) → uses stale value
+
+// Solution: Version numbers
+static class VersionedEntry<V> {
+    final V value;
+    final long version;
+    
+    VersionedEntry(V value, long version) {
+        this.value = value;
+        this.version = version;
+    }
+}
+
+private final AtomicLong globalVersion = new AtomicLong(0);
+
+public V get(K key) {
+    long currentVersion = globalVersion.get();
+    
+    // Check L1
+    VersionedEntry<V> entry = l1.get(key);
+    if (entry != null && entry.version == currentVersion) {
+        return entry.value;  // Version matches, not stale
+    }
+    
+    // Load from lower levels...
+}
+
+public void put(K key, V value) {
+    globalVersion.incrementAndGet();  // Bump version
+    // All cached entries are now stale
+}
+```
+
+### Pitfall 2: Promotion Storm
+
+```java
+// Problem: Hot key accessed by 100 threads
+// All threads miss L1, hit L2
+// All threads try to promote to L1
+// Wasteful!
+
+// Solution: Lazy promotion
+public V get(K key) {
+    // Check L1
+    V value = l1.get(key);
+    if (value != null) return value;
+    
+    // Check L2
+    value = l2.get(key);
+    if (value != null) {
+        // Only promote occasionally (10% of time)
+        if (ThreadLocalRandom.current().nextInt(10) == 0) {
+            l1.put(key, value);
+        }
+        return value;
+    }
+    // ...
+}
+```
+
+### Pitfall 3: L1 Invalidation Across Threads
+
+```java
+// Problem: Write on Thread-1 doesn't invalidate L1 on Thread-2!
+Thread-1: cache.put("key", "v2");
+          Invalidates own L1
+Thread-2: L1 still has "v1" (stale!)
+
+// Solution 1: Don't use L1 for mutable data
+// Solution 2: Versioning (shown above)
+// Solution 3: L1 only for immutable/read-only data
+```
+
+### Pitfall 4: Memory Overhead
+
+```java
+// Problem: 100 threads × 100 L1 entries = 10,000 cached items
+// Plus L2: 1000 items
+// Plus L3: 10,000 items
+// Same key cached 102 times!
+
+// Solution: Smart sizing
+// L1: 10-50 items (hot data only)
+// L2: 1000-10000 items
+// L3: 100000+ items
+```
+
+### Pitfall 5: Thundering Herd on Cache Miss
+
+```java
+// Problem: Key not in any cache, 100 threads request it
+// All 100 threads query database simultaneously!
+
+// Solution: Request coalescing
+private final ConcurrentHashMap<K, CompletableFuture<V>> loadingKeys = 
+    new ConcurrentHashMap<>();
+
+public V get(K key) {
+    // Check caches...
+    
+    // Cache miss, load from DB
+    CompletableFuture<V> future = loadingKeys.computeIfAbsent(key, k -> 
+        CompletableFuture.supplyAsync(() -> {
+            V value = database.read(k);
+            // Cache it...
+            return value;
+        }).whenComplete((v, ex) -> loadingKeys.remove(k))
+    );
+    
+    return future.join();  // Wait for result (only one thread loads!)
+}
+```
+
+### Pitfall 6: Write-Through Performance
+
+```java
+// Problem: Writes are slow (must write to DB)
+cache.put("key", "value");  // Waits for DB write (10ms)
+
+// Solution: Write-behind for L1/L2, write-through for L3
+public void put(K key, V value) {
+    // Update L1 immediately
+    l1Cache.get().put(key, new CacheEntry<>(value, defaultTtlMs));
+    
+    // Update L2 immediately
+    l2Cache.put(key, new CacheEntry<>(value, defaultTtlMs));
+    
+    // Async write to L3 and DB
+    CompletableFuture.runAsync(() -> {
+        l3Cache.put(key, value, defaultTtlMs);
+        database.write(key, value);
+    });
+    
+    System.out.println("PUT: " + key + " (async write to L3/DB)");
+}
+```
+"
+
+---
+
+## Interview Follow-Up Questions
+
+**Q1: How to implement cache warming?**
+
+```java
+public void warmUp(List<K> hotKeys) {
+    System.out.println("Warming up cache with " + hotKeys.size() + " keys");
+    
+    // Load in parallel
+    ExecutorService loader = Executors.newFixedThreadPool(10);
+    CountDownLatch latch = new CountDownLatch(hotKeys.size());
+    
+    for (K key : hotKeys) {
+        loader.submit(() -> {
+            try {
+                V value = database.read(key);
+                if (value != null) {
+                    CacheEntry<V> entry = new CacheEntry<>(value, defaultTtlMs);
+                    l2Cache.put(key, entry);
+                    l3Cache.put(key, value, defaultTtlMs);
+                }
+            } finally {
+                latch.countDown();
+            }
+        });
+    }
+    
+    latch.await();
+    loader.shutdown();
+    
+    System.out.println("Cache warming complete");
+}
+```
+
+**Q2: How to handle cache coherence in distributed system?**
+
+```java
+// Problem: Multiple app servers, each has L1/L2
+// Server 1 writes key=v2
+// Server 2's L1/L2 still have key=v1 (stale!)
+
+// Solution 1: Pub/Sub for invalidation
+public class DistributedCache<K, V> {
+    private final RedisPubSub invalidationChannel;
+    
+    public void put(K key, V value) {
+        database.write(key, value);
+        
+        // Broadcast invalidation
+        invalidationChannel.publish("invalidate:" + key);
+    }
+    
+    // Listen for invalidations
+    private void setupInvalidationListener() {
+        invalidationChannel.subscribe(message -> {
+            if (message.startsWith("invalidate:")) {
+                String key = message.substring(11);
+                l1Cache.get().remove(key);
+                l2Cache.remove(key);
+            }
+        });
+    }
+}
+
+// Solution 2: TTL-based (eventual consistency)
+// Set short TTL (1-5 seconds)
+// Accept brief staleness
+```
+
+**Q3: How to test multi-level cache?**
+
+```java
+@Test
+public void testPromotion() {
+    // Put in L3 only
+    l3Cache.put("key", "value");
+    
+    // First get: L3 hit, promotes to L2
+    assertEquals("value", cache.get("key"));
+    assertEquals(1, l3Hits.get());
+    assertEquals(0, l2Hits.get());
+    
+    // Second get: L2 hit
+    assertEquals("value", cache.get("key"));
+    assertEquals(1, l2Hits.get());
+}
+
+@Test
+public void testInvalidation() {
+    cache.put("key", "v1");
+    assertEquals("v1", cache.get("key"));  // Cache it
+    
+    cache.put("key", "v2");  // Invalidates
+    
+    // Should reload from DB
+    assertEquals("v2", cache.get("key"));
+    assertEquals(2, dbHits.get());  // Both loads from DB
+}
+```
+
+---
+
+# Thread Pool with Dynamic Sizing
+
+## Problem Introduction
+
+**Interviewer**: "Design a thread pool that dynamically adjusts the number of worker threads based on workload. Scale up when tasks are queued, scale down when idle."
+
+**Me**: "Great problem! Let me clarify:
+
+**Concept**:
+```
+Low load:  [W1] [W2]           (2 threads, no queue)
+Medium:    [W1] [W2] [W3] [W4] (4 threads, small queue)
+High load: [W1] [W2] ... [W10] (10 threads, queue growing)
+
+Auto-scaling:
+- Queue depth > threshold → Add workers
+- Workers idle > timeout → Remove workers
+- Min/max bounds
+```
+
+**Questions**:
+1. **Scaling triggers**: Queue depth, CPU usage, or latency?
+2. **Scale up/down rate**: How fast to add/remove threads?
+3. **Bounds**: Min and max thread count?
+4. **Idle timeout**: How long before removing idle thread?
+5. **Task queue**: Bounded or unbounded?
+
+**Assumptions**:
+- Queue depth based scaling
+- Scale up fast, scale down slow
+- Min: 2, Max: 20
+- Idle timeout: 60 seconds
+- Bounded queue with backpressure
+
+Sound good?"
+
+**Interviewer**: "Yes, focus on the dynamic scaling mechanism."
+
+---
+
+## High-Level Design
+
+**Me**: "Here's the architecture:
+
+### Components:
+```
+DynamicThreadPool
+├── Task Queue (BlockingQueue)
+├── Worker Threads (List)
+├── Monitor Thread (checks metrics)
+└── Scale up/down logic
+```
+
+### Scaling Logic:
+```
+Scale Up Triggers:
+- Queue size > threshold
+- All workers busy
+- Task rejection rate high
+
+Scale Down Triggers:
+- Workers idle > timeout
+- Queue empty
+- CPU utilization low
+```
+
+### Key Challenge:
+How to safely add/remove threads while they're processing?"
+
+---
+
+## Implementation
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.*;
+
+public class DynamicThreadPool {
+    
+    // Configuration
+    private final int minThreads;
+    private final int maxThreads;
+    private final long idleTimeoutMs;
+    private final int queueCapacity;
+    
+    // Task queue
+    private final BlockingQueue<Runnable> taskQueue;
+    
+    // Worker management
+    private final List<Worker> workers;
+    private final Lock workerLock;
+    private final AtomicInteger activeWorkers;
+    
+    // State
+    private volatile boolean shutdown = false;
+    
+    // Monitoring
+    private final ScheduledExecutorService monitor;
+    
+    // Statistics
+    private final AtomicLong tasksSubmitted = new AtomicLong(0);
+    private final AtomicLong tasksCompleted = new AtomicLong(0);
+    private final AtomicLong tasksRejected = new AtomicLong(0);
+    private final AtomicInteger peakThreads = new AtomicInteger(0);
+    
+    public DynamicThreadPool(int minThreads, int maxThreads, 
+                            long idleTimeoutMs, int queueCapacity) {
+        this.minThreads = minThreads;
+        this.maxThreads = maxThreads;
+        this.idleTimeoutMs = idleTimeoutMs;
+        this.queueCapacity = queueCapacity;
+        
+        this.taskQueue = new ArrayBlockingQueue<>(queueCapacity);
+        this.workers = new CopyOnWriteArrayList<>();
+        this.workerLock = new ReentrantLock();
+        this.activeWorkers = new AtomicInteger(0);
+        
+        // Start minimum threads
+        for (int i = 0; i < minThreads; i++) {
+            addWorker();
+        }
+        
+        // Start monitor thread
+        this.monitor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "PoolMonitor");
+            t.setDaemon(true);
+            return t;
+        });
+        
+        monitor.scheduleAtFixedRate(
+            this::adjustPoolSize,
+            1000,
+            1000,
+            TimeUnit.MILLISECONDS
+        );
+        
+        System.out.println("Dynamic thread pool started: min=" + minThreads + 
+            ", max=" + maxThreads);
+    }
+    
+    /**
+     * Submit task
+     */
+    public void submit(Runnable task) {
+        if (shutdown) {
+            throw new RejectedExecutionException("Pool is shut down");
+        }
+        
+        tasksSubmitted.incrementAndGet();
+        
+        if (!taskQueue.offer(task)) {
+            // Queue full, try to scale up
+            if (scaleUp()) {
+                // Successfully added worker, try again
+                if (!taskQueue.offer(task)) {
+                    tasksRejected.incrementAndGet();
+                    throw new RejectedExecutionException("Queue full");
+                }
+            } else {
+                tasksRejected.incrementAndGet();
+                throw new RejectedExecutionException("Queue full, max threads reached");
+            }
+        }
+        
+        System.out.println("Task submitted (queue size: " + taskQueue.size() + 
+            ", workers: " + workers.size() + ")");
+    }
+    
+    /**
+     * Worker thread
+     */
+    class Worker implements Runnable {
+        private final int id;
+        private final AtomicLong lastActiveTime;
+        private volatile boolean stopped = false;
+        
+        Worker(int id) {
+            this.id = id;
+            this.lastActiveTime = new AtomicLong(System.currentTimeMillis());
+        }
+        
+        @Override
+        public void run() {
+            System.out.println("Worker-" + id + " started");
+            
+            while (!stopped && !shutdown) {
+                try {
+                    // Poll with timeout
+                    Runnable task = taskQueue.poll(1, TimeUnit.SECONDS);
+                    
+                    if (task != null) {
+                        // Got task, process it
+                        activeWorkers.incrementAndGet();
+                        lastActiveTime.set(System.currentTimeMillis());
+                        
+                        try {
+                            System.out.println("Worker-" + id + " processing task");
+                            task.run();
+                            tasksCompleted.incrementAndGet();
+                        } catch (Exception e) {
+                            System.err.println("Worker-" + id + " task error: " + e);
+                        } finally {
+                            activeWorkers.decrementAndGet();
+                        }
+                    } else {
+                        // Timeout, check if should stop
+                        if (shouldStop()) {
+                            stopped = true;
+                        }
+                    }
+                    
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            
+            System.out.println("Worker-" + id + " stopped");
+        }
+        
+        boolean shouldStop() {
+            // Don't stop if below minimum
+            if (workers.size() <= minThreads) {
+                return false;
+            }
+            
+            // Check idle time
+            long idleTime = System.currentTimeMillis() - lastActiveTime.get();
+            return idleTime > idleTimeoutMs;
+        }
+        
+        void stopWorker() {
+            stopped = true;
+        }
+    }
+    
+    /**
+     * Add worker thread
+     */
+    private boolean addWorker() {
+        workerLock.lock();
+        try {
+            if (workers.size() >= maxThreads) {
+                return false;
+            }
+            
+            Worker worker = new Worker(workers.size());
+            workers.add(worker);
+            new Thread(worker, "Worker-" + worker.id).start();
+            
+            int size = workers.size();
+            if (size > peakThreads.get()) {
+                peakThreads.set(size);
+            }
+            
+            System.out.println("Added worker (total: " + size + ")");
+            return true;
+            
+        } finally {
+            workerLock.unlock();
+        }
+    }
+    
+    /**
+     * Remove idle workers
+     */
+    private void removeIdleWorkers() {
+        workerLock.lock();
+        try {
+            if (workers.size() <= minThreads) {
+                return;
+            }
+            
+            Iterator<Worker> iterator = workers.iterator();
+            while (iterator.hasNext()) {
+                Worker worker = iterator.next();
+                
+                if (worker.shouldStop()) {
+                    worker.stopWorker();
+                    iterator.remove();
+                    System.out.println("Removed idle worker (total: " + workers.size() + ")");
+                    
+                    if (workers.size() <= minThreads) {
+                        break;
+                    }
+                }
+            }
+        } finally {
+            workerLock.unlock();
+        }
+    }
+    
+    /**
+     * Scale up if needed
+     */
+    private boolean scaleUp() {
+        int queueSize = taskQueue.size();
+        int workerCount = workers.size();
+        
+        // Scale up if queue is growing and not at max
+        if (queueSize > queueCapacity / 2 && workerCount < maxThreads) {
+            return addWorker();
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Periodic adjustment
+     */
+    private void adjustPoolSize() {
+        int queueSize = taskQueue.size();
+        int workerCount = workers.size();
+        int active = activeWorkers.get();
+        
+        System.out.println("\n[Monitor] Queue: " + queueSize + 
+            ", Workers: " + workerCount + ", Active: " + active);
+        
+        // Scale up conditions
+        if (queueSize > 10 && workerCount < maxThreads) {
+            System.out.println("[Monitor] Queue building up, scaling up");
+            addWorker();
+        }
+        else if (queueSize > 50 && workerCount < maxThreads) {
+            System.out.println("[Monitor] Queue critical, adding multiple workers");
+            addWorker();
+            addWorker();
+        }
+        // Scale down conditions
+        else if (queueSize == 0 && active == 0 && workerCount > minThreads) {
+            System.out.println("[Monitor] All idle, checking for removal");
+            removeIdleWorkers();
+        }
+    }
+    
+    public void shutdown() throws InterruptedException {
+        shutdown = true;
+        monitor.shutdown();
+        
+        // Stop all workers
+        for (Worker worker : workers) {
+            worker.stopWorker();
+        }
+        
+        System.out.println("Thread pool shut down");
+    }
+    
+    public Map<String, Object> getStatistics() {
+        Map<String, Object> stats = new HashMap<>();
+        stats.put("currentThreads", workers.size());
+        stats.put("activeThreads", activeWorkers.get());
+        stats.put("peakThreads", peakThreads.get());
+        stats.put("queueSize", taskQueue.size());
+        stats.put("tasksSubmitted", tasksSubmitted.get());
+        stats.put("tasksCompleted", tasksCompleted.get());
+        stats.put("tasksRejected", tasksRejected.get());
+        return stats;
+    }
+    
+    // Test
+    public static void main(String[] args) throws InterruptedException {
+        DynamicThreadPool pool = new DynamicThreadPool(
+            2,      // Min threads
+            10,     // Max threads
+            5000,   // 5 second idle timeout
+            100     // Queue capacity
+        );
+        
+        System.out.println("\n=== Phase 1: Low Load ===");
+        for (int i = 0; i < 5; i++) {
+            pool.submit(() -> {
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            Thread.sleep(100);
+        }
+        
+        Thread.sleep(2000);
+        
+        System.out.println("\n=== Phase 2: High Load ===");
+        for (int i = 0; i < 50; i++) {
+            pool.submit(() -> {
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            Thread.sleep(10);
+        }
+        
+        Thread.sleep(5000);
+        
+        System.out.println("\n=== Phase 3: Cool Down ===");
+        Thread.sleep(10000);  // Let workers become idle
+        
+        System.out.println("\n=== Final Statistics ===");
+        pool.getStatistics().forEach((key, value) -> 
+            System.out.println(key + ": " + value));
+        
+        pool.shutdown();
+    }
+}
+```
+
+---
+
+## Pitfalls and Edge Cases
+
+**Me**: "Key gotchas:
+
+### Pitfall 1: Scaling Too Fast
+
+```java
+// ❌ WRONG - Add thread for every queued task
+if (queueSize > 0) {
+    addWorker();  // Thrashing!
+}
+
+// ✓ CORRECT - Gradual scaling with thresholds
+if (queueSize > 10 && workerCount < maxThreads) {
+    addWorker();
+}
+```
+
+### Pitfall 2: Removing Active Workers
+
+```java
+// ❌ WRONG - Remove any worker
+workers.remove(0);  // Might be processing!
+
+// ✓ CORRECT - Only remove idle workers
+for (Worker w : workers) {
+    if (w.isIdle() && w.idleTime() > threshold) {
+        w.stopGracefully();
+        workers.remove(w);
+    }
+}
+```
+
+### Pitfall 3: Race Condition in Worker Count
+
+```java
+// ❌ WRONG - Check-then-act race
+if (workers.size() < maxThreads) {
+    // Another thread might add worker here!
+    addWorker();  // Might exceed max!
+}
+
+// ✓ CORRECT - Atomic check-and-add
+workerLock.lock();
+try {
+    if (workers.size() < maxThreads) {
+        addWorker();
+    }
+} finally {
+    workerLock.unlock();
+}
+```
+
+### Pitfall 4: Thread Leak on Exception
+
+```java
+// ❌ WRONG - Thread dies on exception
+public void run() {
+    while (!stopped) {
+        Runnable task = queue.take();
+        task.run();  // Exception kills thread!
+    }
+}
+
+// ✓ CORRECT - Catch exceptions
+public void run() {
+    while (!stopped) {
+        try {
+            Runnable task = queue.take();
+            task.run();
+        } catch (Exception e) {
+            System.err.println("Task error: " + e);
+            // Thread continues!
+        }
+    }
+}
+```
+
+### Pitfall 5: Shutdown Race
+
+```java
+// Problem: Shutdown while adding workers
+Thread-1: adjustPoolSize() → addWorker()
+Thread-2: shutdown() → stop all workers
+Thread-1: New worker added after shutdown!
+
+// Solution: Check shutdown flag
+private boolean addWorker() {
+    if (shutdown) {
+        return false;
+    }
+    
+    workerLock.lock();
+    try {
+        if (shutdown || workers.size() >= maxThreads) {
+            return false;
+        }
+        // Add worker...
+    } finally {
+        workerLock.unlock();
+    }
+}
+```
+
+### Pitfall 6: Oscillation (Thrashing)
+
+```java
+// Problem:
+Load increases → Add workers
+Workers start → Process queue → Queue empty
+Monitor sees empty queue → Remove workers
+Load increases again → Add workers
+Repeat! (thrashing)
+
+// Solution: Hysteresis (different thresholds for up/down)
+private void adjustPoolSize() {
+    int queueSize = taskQueue.size();
+    int workerCount = workers.size();
+    
+    // Scale up: queue > 20
+    if (queueSize > 20 && workerCount < maxThreads) {
+        addWorker();
+    }
+    // Scale down: queue < 5 (lower threshold!)
+    else if (queueSize < 5 && workerCount > minThreads) {
+        removeIdleWorkers();
+    }
+}
+```
+"
+
+---
+
+## Lock-Free Optimization
+
+**Me**: "Can we optimize with lock-free?
+
+### Current Bottleneck: Worker List Management
