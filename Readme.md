@@ -13120,4 +13120,2223 @@ These solutions cover:
 ✅ **Scalability** using thread pools and non-blocking algorithms  
 ✅ **Production-ready patterns** like double-checked locking and proper resource cleanup
 
-Would you like me to explain any specific solution in more detail or provide solutions for the remaining problems (6-13)?
+# Solutions for Problems 6-13
+
+---
+
+## 6. Worker Node Task Distribution with Rebalancing
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
+
+class Task {
+    String taskId;
+    Runnable work;
+    int cpuIntensity; // 1-10 scale
+    
+    public Task(String taskId, Runnable work, int cpuIntensity) {
+        this.taskId = taskId;
+        this.work = work;
+        this.cpuIntensity = cpuIntensity;
+    }
+}
+
+class WorkerNode {
+    String nodeId;
+    BlockingQueue<Task> taskQueue;
+    ExecutorService executor;
+    volatile int totalCpuLoad;
+    private final Lock lock = new ReentrantLock();
+    
+    public WorkerNode(String nodeId) {
+        this.nodeId = nodeId;
+        this.taskQueue = new LinkedBlockingQueue<>();
+        this.executor = Executors.newSingleThreadExecutor();
+        this.totalCpuLoad = 0;
+    }
+    
+    public void addTask(Task task) {
+        lock.lock();
+        try {
+            taskQueue.offer(task);
+            totalCpuLoad += task.cpuIntensity;
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    public Task removeTask() {
+        lock.lock();
+        try {
+            Task task = taskQueue.poll();
+            if (task != null) {
+                totalCpuLoad -= task.cpuIntensity;
+            }
+            return task;
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    public void runTasks() {
+        executor.submit(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    Task task = taskQueue.take();
+                    System.out.println("Node " + nodeId + " executing task " + task.taskId);
+                    task.work.run();
+                    
+                    lock.lock();
+                    try {
+                        totalCpuLoad -= task.cpuIntensity;
+                    } finally {
+                        lock.unlock();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        });
+    }
+    
+    public int getQueueSize() {
+        return taskQueue.size();
+    }
+    
+    public int getTotalCpuLoad() {
+        lock.lock();
+        try {
+            return totalCpuLoad;
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    public List<Task> getAllTasks() {
+        lock.lock();
+        try {
+            return new ArrayList<>(taskQueue);
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+
+class WorkerNodeManager {
+    private final Map<String, WorkerNode> nodes = new ConcurrentHashMap<>();
+    private final ReadWriteLock rwLock = new ReentrantReadWriteLock();
+    private final ScheduledExecutorService rebalancer = 
+        Executors.newSingleThreadScheduledExecutor();
+    
+    public WorkerNodeManager(int numNodes) {
+        // Initialize nodes
+        for (int i = 0; i < numNodes; i++) {
+            String nodeId = "Node-" + i;
+            WorkerNode node = new WorkerNode(nodeId);
+            nodes.put(nodeId, node);
+            node.runTasks();
+        }
+        
+        // Auto-rebalance every 5 seconds
+        rebalancer.scheduleAtFixedRate(this::rebalanceTasks, 5, 5, TimeUnit.SECONDS);
+    }
+    
+    // Add task to specific node
+    public void addTask(String nodeId, String taskId, Runnable work, int cpuIntensity) {
+        rwLock.readLock().lock();
+        try {
+            WorkerNode node = nodes.get(nodeId);
+            if (node == null) {
+                throw new IllegalArgumentException("Node not found: " + nodeId);
+            }
+            
+            Task task = new Task(taskId, work, cpuIntensity);
+            node.addTask(task);
+            System.out.println("Added task " + taskId + " to " + nodeId);
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+    
+    // Add task to least loaded node
+    public void runTask(String taskId, Runnable work, int cpuIntensity) {
+        rwLock.readLock().lock();
+        try {
+            WorkerNode leastLoadedNode = findLeastLoadedNode();
+            Task task = new Task(taskId, work, cpuIntensity);
+            leastLoadedNode.addTask(task);
+            System.out.println("Added task " + taskId + " to " + leastLoadedNode.nodeId);
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+    
+    private WorkerNode findLeastLoadedNode() {
+        return nodes.values().stream()
+            .min(Comparator.comparingInt(WorkerNode::getTotalCpuLoad))
+            .orElseThrow();
+    }
+    
+    // Rebalance based on CPU load
+    public void rebalanceTasks() {
+        rwLock.writeLock().lock();
+        try {
+            System.out.println("\n=== Rebalancing Tasks ===");
+            
+            // Calculate average load
+            int totalLoad = nodes.values().stream()
+                .mapToInt(WorkerNode::getTotalCpuLoad)
+                .sum();
+            int avgLoad = totalLoad / nodes.size();
+            int threshold = (int) (avgLoad * 1.5); // 50% above average
+            
+            System.out.println("Average load: " + avgLoad + ", Threshold: " + threshold);
+            
+            // Find overloaded and underloaded nodes
+            List<WorkerNode> overloaded = nodes.values().stream()
+                .filter(n -> n.getTotalCpuLoad() > threshold)
+                .sorted(Comparator.comparingInt(WorkerNode::getTotalCpuLoad).reversed())
+                .collect(Collectors.toList());
+            
+            List<WorkerNode> underloaded = nodes.values().stream()
+                .filter(n -> n.getTotalCpuLoad() < avgLoad)
+                .sorted(Comparator.comparingInt(WorkerNode::getTotalCpuLoad))
+                .collect(Collectors.toList());
+            
+            // Move tasks from overloaded to underloaded
+            for (WorkerNode overloadedNode : overloaded) {
+                while (overloadedNode.getTotalCpuLoad() > avgLoad && !underloaded.isEmpty()) {
+                    WorkerNode underloadedNode = underloaded.get(0);
+                    
+                    // Remove a task from overloaded node
+                    Task task = overloadedNode.removeTask();
+                    if (task == null) break;
+                    
+                    // Add to underloaded node
+                    underloadedNode.addTask(task);
+                    
+                    System.out.println("Moved task " + task.taskId + " from " + 
+                                     overloadedNode.nodeId + " to " + underloadedNode.nodeId);
+                    
+                    // Re-sort underloaded list
+                    if (underloadedNode.getTotalCpuLoad() >= avgLoad) {
+                        underloaded.remove(0);
+                    }
+                }
+            }
+            
+            printTasks();
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+    
+    public void printTasks() {
+        rwLock.readLock().lock();
+        try {
+            System.out.println("\n=== Current Task Distribution ===");
+            for (WorkerNode node : nodes.values()) {
+                System.out.println(node.nodeId + ": " + 
+                                 node.getQueueSize() + " tasks, " +
+                                 "CPU load: " + node.getTotalCpuLoad());
+                
+                List<Task> tasks = node.getAllTasks();
+                for (Task task : tasks) {
+                    System.out.println("  - " + task.taskId + 
+                                     " (intensity: " + task.cpuIntensity + ")");
+                }
+            }
+            System.out.println();
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+    
+    public void shutdown() {
+        rebalancer.shutdown();
+        nodes.values().forEach(n -> n.executor.shutdown());
+    }
+}
+
+// Test
+class WorkerNodeTest {
+    public static void main(String[] args) throws InterruptedException {
+        WorkerNodeManager manager = new WorkerNodeManager(4);
+        
+        // Add tasks with varying CPU intensity
+        for (int i = 0; i < 20; i++) {
+            final int taskNum = i;
+            int cpuIntensity = ThreadLocalRandom.current().nextInt(1, 11);
+            
+            manager.runTask("Task-" + i, () -> {
+                try {
+                    System.out.println("Executing Task-" + taskNum);
+                    Thread.sleep(cpuIntensity * 1000); // Simulate work
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }, cpuIntensity);
+            
+            Thread.sleep(100);
+        }
+        
+        // Let rebalancing happen
+        Thread.sleep(15000);
+        
+        manager.printTasks();
+        manager.shutdown();
+    }
+}
+```
+
+---
+
+## 7. Snapshot Array (LeetCode 1146)
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+
+class SnapshotArray {
+    private final List<TreeMap<Integer, Integer>> snapshots; // index -> (snapId -> value)
+    private int currentSnapId;
+    private final ReadWriteLock lock = new ReentrantReadWriteLock();
+    
+    public SnapshotArray(int length) {
+        snapshots = new ArrayList<>(length);
+        for (int i = 0; i < length; i++) {
+            TreeMap<Integer, Integer> history = new TreeMap<>();
+            history.put(0, 0); // Initial value at snap_id 0
+            snapshots.add(history);
+        }
+        currentSnapId = 0;
+    }
+    
+    public void set(int index, int val) {
+        lock.writeLock().lock();
+        try {
+            snapshots.get(index).put(currentSnapId, val);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+    
+    public int snap() {
+        lock.writeLock().lock();
+        try {
+            return currentSnapId++;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+    
+    public int get(int index, int snap_id) {
+        lock.readLock().lock();
+        try {
+            TreeMap<Integer, Integer> history = snapshots.get(index);
+            // Find the largest snap_id <= requested snap_id
+            Map.Entry<Integer, Integer> entry = history.floorEntry(snap_id);
+            return entry != null ? entry.getValue() : 0;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+    
+    // For debugging
+    public void printHistory(int index) {
+        lock.readLock().lock();
+        try {
+            System.out.println("History for index " + index + ": " + snapshots.get(index));
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+}
+
+// Test
+class SnapshotArrayTest {
+    public static void main(String[] args) throws InterruptedException {
+        SnapshotArray array = new SnapshotArray(3);
+        ExecutorService executor = Executors.newFixedThreadPool(5);
+        
+        // Thread 1: Set values
+        executor.submit(() -> {
+            array.set(0, 5);
+            array.set(1, 6);
+            System.out.println("Set values");
+        });
+        
+        Thread.sleep(100);
+        
+        // Thread 2: Take snapshot
+        executor.submit(() -> {
+            int snapId = array.snap();
+            System.out.println("Snapshot taken: " + snapId);
+        });
+        
+        Thread.sleep(100);
+        
+        // Thread 3: Set more values
+        executor.submit(() -> {
+            array.set(0, 10);
+            System.out.println("Updated index 0");
+        });
+        
+        Thread.sleep(100);
+        
+        // Thread 4: Take another snapshot
+        executor.submit(() -> {
+            int snapId = array.snap();
+            System.out.println("Snapshot taken: " + snapId);
+        });
+        
+        Thread.sleep(100);
+        
+        // Thread 5: Read from different snapshots
+        executor.submit(() -> {
+            System.out.println("get(0, 0) = " + array.get(0, 0)); // Should be 5
+            System.out.println("get(0, 1) = " + array.get(0, 1)); // Should be 10
+            System.out.println("get(1, 0) = " + array.get(1, 0)); // Should be 6
+            
+            array.printHistory(0);
+            array.printHistory(1);
+        });
+        
+        executor.shutdown();
+        executor.awaitTermination(1, TimeUnit.MINUTES);
+    }
+}
+```
+
+---
+
+## 8. JavaScript Promise Implementation in Java
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.*;
+
+class Promise<T> {
+    private enum State {
+        PENDING, FULFILLED, REJECTED
+    }
+    
+    private volatile State state = State.PENDING;
+    private volatile T value;
+    private volatile Throwable error;
+    
+    private final List<Consumer<T>> onFulfilledCallbacks = new CopyOnWriteArrayList<>();
+    private final List<Consumer<Throwable>> onRejectedCallbacks = new CopyOnWriteArrayList<>();
+    private final ExecutorService executor;
+    
+    // Constructor with executor function
+    public Promise(BiConsumer<Consumer<T>, Consumer<Throwable>> executor) {
+        this.executor = Executors.newCachedThreadPool();
+        
+        // Execute the promise logic asynchronously
+        this.executor.submit(() -> {
+            try {
+                executor.accept(this::resolve, this::reject);
+            } catch (Exception e) {
+                reject(e);
+            }
+        });
+    }
+    
+    // Private constructor for chaining
+    private Promise(ExecutorService executor) {
+        this.executor = executor;
+    }
+    
+    // Resolve the promise
+    private synchronized void resolve(T result) {
+        if (state != State.PENDING) return;
+        
+        state = State.FULFILLED;
+        value = result;
+        
+        // Execute all registered callbacks
+        for (Consumer<T> callback : onFulfilledCallbacks) {
+            executor.submit(() -> callback.accept(result));
+        }
+        onFulfilledCallbacks.clear();
+    }
+    
+    // Reject the promise
+    private synchronized void reject(Throwable error) {
+        if (state != State.PENDING) return;
+        
+        state = State.REJECTED;
+        this.error = error;
+        
+        // Execute all registered callbacks
+        for (Consumer<Throwable> callback : onRejectedCallbacks) {
+            executor.submit(() -> callback.accept(error));
+        }
+        onRejectedCallbacks.clear();
+    }
+    
+    // then() method for chaining
+    public <U> Promise<U> then(Function<T, U> onFulfilled) {
+        return then(onFulfilled, null);
+    }
+    
+    public <U> Promise<U> then(Function<T, U> onFulfilled, 
+                               Consumer<Throwable> onRejected) {
+        Promise<U> nextPromise = new Promise<>(this.executor);
+        
+        Consumer<T> fulfilledCallback = value -> {
+            try {
+                if (onFulfilled != null) {
+                    U result = onFulfilled.apply(value);
+                    nextPromise.resolve(result);
+                } else {
+                    // Type cast for pass-through
+                    nextPromise.resolve((U) value);
+                }
+            } catch (Exception e) {
+                nextPromise.reject(e);
+            }
+        };
+        
+        Consumer<Throwable> rejectedCallback = error -> {
+            try {
+                if (onRejected != null) {
+                    onRejected.accept(error);
+                }
+                nextPromise.reject(error);
+            } catch (Exception e) {
+                nextPromise.reject(e);
+            }
+        };
+        
+        synchronized (this) {
+            if (state == State.FULFILLED) {
+                executor.submit(() -> fulfilledCallback.accept(value));
+            } else if (state == State.REJECTED) {
+                executor.submit(() -> rejectedCallback.accept(error));
+            } else {
+                onFulfilledCallbacks.add(fulfilledCallback);
+                onRejectedCallbacks.add(rejectedCallback);
+            }
+        }
+        
+        return nextPromise;
+    }
+    
+    // catch() method
+    public Promise<T> catchError(Consumer<Throwable> onRejected) {
+        return then(null, onRejected);
+    }
+    
+    // finally() method
+    public Promise<T> finallyDo(Runnable action) {
+        return then(
+            value -> {
+                action.run();
+                return value;
+            },
+            error -> action.run()
+        );
+    }
+    
+    // Static method: Promise.resolve()
+    public static <T> Promise<T> resolve(T value) {
+        return new Promise<>((resolve, reject) -> resolve.accept(value));
+    }
+    
+    // Static method: Promise.reject()
+    public static <T> Promise<T> reject(Throwable error) {
+        return new Promise<>((resolve, reject) -> reject.accept(error));
+    }
+    
+    // Static method: Promise.all()
+    public static <T> Promise<List<T>> all(List<Promise<T>> promises) {
+        return new Promise<>((resolve, reject) -> {
+            List<T> results = new CopyOnWriteArrayList<>(
+                Collections.nCopies(promises.size(), null));
+            AtomicInteger completed = new AtomicInteger(0);
+            
+            for (int i = 0; i < promises.size(); i++) {
+                final int index = i;
+                promises.get(i).then(value -> {
+                    results.set(index, value);
+                    if (completed.incrementAndGet() == promises.size()) {
+                        resolve.accept(results);
+                    }
+                    return value;
+                }).catchError(reject);
+            }
+        });
+    }
+    
+    // Static method: Promise.race()
+    public static <T> Promise<T> race(List<Promise<T>> promises) {
+        return new Promise<>((resolve, reject) -> {
+            AtomicBoolean settled = new AtomicBoolean(false);
+            
+            for (Promise<T> promise : promises) {
+                promise.then(value -> {
+                    if (settled.compareAndSet(false, true)) {
+                        resolve.accept(value);
+                    }
+                    return value;
+                }).catchError(error -> {
+                    if (settled.compareAndSet(false, true)) {
+                        reject.accept(error);
+                    }
+                });
+            }
+        });
+    }
+    
+    // Block and wait for result (not in JS Promise, but useful for Java)
+    public T await() throws InterruptedException, ExecutionException {
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicReference<T> result = new AtomicReference<>();
+        AtomicReference<Throwable> errorRef = new AtomicReference<>();
+        
+        then(value -> {
+            result.set(value);
+            latch.countDown();
+            return value;
+        }).catchError(error -> {
+            errorRef.set(error);
+            latch.countDown();
+        });
+        
+        latch.await();
+        
+        if (errorRef.get() != null) {
+            throw new ExecutionException(errorRef.get());
+        }
+        return result.get();
+    }
+    
+    public void shutdown() {
+        executor.shutdown();
+    }
+}
+
+// Test
+class PromiseTest {
+    public static void main(String[] args) throws Exception {
+        System.out.println("=== Basic Promise ===");
+        Promise<String> promise1 = new Promise<>((resolve, reject) -> {
+            try {
+                Thread.sleep(1000);
+                resolve.accept("Hello from Promise!");
+            } catch (InterruptedException e) {
+                reject.accept(e);
+            }
+        });
+        
+        promise1.then(value -> {
+            System.out.println("Resolved: " + value);
+            return value.length();
+        }).then(length -> {
+            System.out.println("Length: " + length);
+            return length;
+        });
+        
+        Thread.sleep(2000);
+        
+        System.out.println("\n=== Promise.all() ===");
+        List<Promise<Integer>> promises = Arrays.asList(
+            new Promise<>((resolve, reject) -> {
+                Thread.sleep(1000);
+                resolve.accept(1);
+            }),
+            new Promise<>((resolve, reject) -> {
+                Thread.sleep(500);
+                resolve.accept(2);
+            }),
+            new Promise<>((resolve, reject) -> {
+                Thread.sleep(1500);
+                resolve.accept(3);
+            })
+        );
+        
+        Promise<List<Integer>> allPromise = Promise.all(promises);
+        allPromise.then(results -> {
+            System.out.println("All resolved: " + results);
+            return results;
+        });
+        
+        Thread.sleep(3000);
+        
+        System.out.println("\n=== Promise.race() ===");
+        Promise<String> racePromise = Promise.race(Arrays.asList(
+            new Promise<>((resolve, reject) -> {
+                Thread.sleep(1000);
+                resolve.accept("Slow");
+            }),
+            new Promise<>((resolve, reject) -> {
+                Thread.sleep(200);
+                resolve.accept("Fast");
+            })
+        ));
+        
+        racePromise.then(result -> {
+            System.out.println("Race winner: " + result);
+            return result;
+        });
+        
+        Thread.sleep(2000);
+        
+        System.out.println("\n=== Error Handling ===");
+        Promise<Integer> errorPromise = new Promise<>((resolve, reject) -> {
+            Thread.sleep(500);
+            reject.accept(new RuntimeException("Something went wrong!"));
+        });
+        
+        errorPromise
+            .then(value -> {
+                System.out.println("This won't execute");
+                return value;
+            })
+            .catchError(error -> {
+                System.out.println("Caught error: " + error.getMessage());
+            })
+            .finallyDo(() -> {
+                System.out.println("Finally block executed");
+            });
+        
+        Thread.sleep(2000);
+        promise1.shutdown();
+    }
+}
+```
+
+---
+
+## 9. Task Scheduler with Non-Blocking API
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+
+class ClientTask {
+    String taskId;
+    String clientId;
+    Runnable task;
+    CompletableFuture<Void> future;
+    
+    public ClientTask(String taskId, String clientId, Runnable task) {
+        this.taskId = taskId;
+        this.clientId = clientId;
+        this.task = task;
+        this.future = new CompletableFuture<>();
+    }
+}
+
+class TaskScheduler {
+    private final int maxThreads;
+    private final ExecutorService executor;
+    private final BlockingQueue<ClientTask> taskQueue;
+    private final Map<String, List<CompletableFuture<Void>>> clientFutures;
+    private final AtomicInteger activeThreads;
+    
+    public TaskScheduler(int maxThreads) {
+        this.maxThreads = maxThreads;
+        this.executor = Executors.newFixedThreadPool(maxThreads);
+        this.taskQueue = new LinkedBlockingQueue<>();
+        this.clientFutures = new ConcurrentHashMap<>();
+        this.activeThreads = new AtomicInteger(0);
+        
+        // Start worker threads
+        for (int i = 0; i < maxThreads; i++) {
+            startWorker();
+        }
+    }
+    
+    private void startWorker() {
+        executor.submit(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    ClientTask clientTask = taskQueue.take();
+                    activeThreads.incrementAndGet();
+                    
+                    try {
+                        System.out.println("Executing task " + clientTask.taskId + 
+                                         " for client " + clientTask.clientId);
+                        clientTask.task.run();
+                        clientTask.future.complete(null);
+                    } catch (Exception e) {
+                        clientTask.future.completeExceptionally(e);
+                    } finally {
+                        activeThreads.decrementAndGet();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        });
+    }
+    
+    /**
+     * Schedule a task - returns immediately without blocking
+     * @return CompletableFuture that completes when task finishes
+     */
+    public CompletableFuture<Void> scheduleTask(String clientId, 
+                                                 String taskId, 
+                                                 Runnable task) {
+        ClientTask clientTask = new ClientTask(taskId, clientId, task);
+        
+        // Add to queue (non-blocking)
+        taskQueue.offer(clientTask);
+        
+        // Track futures per client
+        clientFutures.computeIfAbsent(clientId, k -> new CopyOnWriteArrayList<>())
+                    .add(clientTask.future);
+        
+        System.out.println("Task " + taskId + " scheduled for client " + clientId + 
+                         " (Queue size: " + taskQueue.size() + ")");
+        
+        return clientTask.future;
+    }
+    
+    /**
+     * Wait for all tasks of a specific client to complete
+     */
+    public CompletableFuture<Void> awaitClientTasks(String clientId) {
+        List<CompletableFuture<Void>> futures = clientFutures.getOrDefault(
+            clientId, Collections.emptyList());
+        
+        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+    }
+    
+    /**
+     * Get status of the scheduler
+     */
+    public SchedulerStatus getStatus() {
+        return new SchedulerStatus(
+            activeThreads.get(),
+            taskQueue.size(),
+            maxThreads
+        );
+    }
+    
+    public void shutdown() {
+        executor.shutdown();
+    }
+    
+    static class SchedulerStatus {
+        int activeThreads;
+        int queuedTasks;
+        int maxThreads;
+        
+        public SchedulerStatus(int activeThreads, int queuedTasks, int maxThreads) {
+            this.activeThreads = activeThreads;
+            this.queuedTasks = queuedTasks;
+            this.maxThreads = maxThreads;
+        }
+        
+        @Override
+        public String toString() {
+            return String.format("Active: %d/%d, Queued: %d", 
+                               activeThreads, maxThreads, queuedTasks);
+        }
+    }
+}
+
+// Test
+class TaskSchedulerTest {
+    public static void main(String[] args) throws Exception {
+        TaskScheduler scheduler = new TaskScheduler(3);
+        
+        // Schedule multiple tasks for different clients
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        
+        for (int i = 0; i < 10; i++) {
+            final int taskNum = i;
+            String clientId = "Client-" + (i % 3);
+            String taskId = "Task-" + i;
+            
+            CompletableFuture<Void> future = scheduler.scheduleTask(
+                clientId,
+                taskId,
+                () -> {
+                    try {
+                        System.out.println("  Running " + taskId);
+                        Thread.sleep(ThreadLocalRandom.current().nextInt(1000, 3000));
+                        System.out.println("  Completed " + taskId);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            );
+            
+            // Attach callback (non-blocking)
+            future.thenRun(() -> {
+                System.out.println("✓ Callback: " + taskId + " finished");
+            }).exceptionally(e -> {
+                System.out.println("✗ Callback: " + taskId + " failed - " + e.getMessage());
+                return null;
+            });
+            
+            futures.add(future);
+            
+            System.out.println("Status: " + scheduler.getStatus());
+            Thread.sleep(200);
+        }
+        
+        // Wait for specific client's tasks
+        System.out.println("\n=== Waiting for Client-0 tasks ===");
+        scheduler.awaitClientTasks("Client-0").thenRun(() -> {
+            System.out.println("All Client-0 tasks completed!");
+        });
+        
+        // Wait for all tasks
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+            .thenRun(() -> {
+                System.out.println("\n=== All tasks completed ===");
+                System.out.println("Final status: " + scheduler.getStatus());
+                scheduler.shutdown();
+            });
+        
+        Thread.sleep(15000);
+    }
+}
+```
+
+---
+
+## 10. Large File Transfer System
+
+```java
+import java.io.*;
+import java.net.*;
+import java.nio.file.*;
+import java.security.*;
+import java.util.*;
+import java.util.concurrent.*;
+
+class FilePart {
+    int partNumber;
+    long offset;
+    long size;
+    String checksum;
+    
+    public FilePart(int partNumber, long offset, long size) {
+        this.partNumber = partNumber;
+        this.offset = offset;
+        this.size = size;
+    }
+}
+
+class FileTransferManager {
+    private static final long PART_SIZE = 100 * 1024 * 1024; // 100 MB per part
+    private static final int MAX_CONCURRENT_TRANSFERS = 8; // Stay under 10 Gbps
+    private static final int MAX_RETRIES = 3;
+    
+    private final ExecutorService transferExecutor;
+    private final String destinationIP;
+    private final int port;
+    
+    public FileTransferManager(String destinationIP, int port) {
+        this.destinationIP = destinationIP;
+        this.port = port;
+        this.transferExecutor = Executors.newFixedThreadPool(MAX_CONCURRENT_TRANSFERS);
+    }
+    
+    /**
+     * Transfer a large file by splitting it into parts
+     */
+    public CompletableFuture<TransferResult> transferFile(Path sourceFile) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                long fileSize = Files.size(sourceFile);
+                List<FilePart> parts = splitFile(sourceFile, fileSize);
+                
+                System.out.println("File size: " + formatSize(fileSize));
+                System.out.println("Split into " + parts.size() + " parts");
+                
+                // Send metadata first
+                sendMetadata(sourceFile.getFileName().toString(), fileSize, parts.size());
+                
+                // Transfer all parts concurrently
+                List<CompletableFuture<PartTransferResult>> futures = new ArrayList<>();
+                
+                for (FilePart part : parts) {
+                    CompletableFuture<PartTransferResult> future = 
+                        transferPartWithRetry(sourceFile, part);
+                    futures.add(future);
+                }
+                
+                // Wait for all parts to complete
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+                
+                // Collect results
+                long totalTransferred = 0;
+                long totalTime = 0;
+                int failedParts = 0;
+                
+                for (CompletableFuture<PartTransferResult> future : futures) {
+                    PartTransferResult result = future.get();
+                    totalTransferred += result.bytesTransferred;
+                    totalTime = Math.max(totalTime, result.timeMillis);
+                    if (!result.success) failedParts++;
+                }
+                
+                if (failedParts > 0) {
+                    throw new IOException(failedParts + " parts failed to transfer");
+                }
+                
+                // Send completion signal
+                sendCompletionSignal(sourceFile.getFileName().toString());
+                
+                double throughputGbps = (totalTransferred * 8.0) / (totalTime / 1000.0) / 1_000_000_000;
+                
+                return new TransferResult(
+                    sourceFile.getFileName().toString(),
+                    totalTransferred,
+                    totalTime,
+                    throughputGbps,
+                    true
+                );
+                
+            } catch (Exception e) {
+                e.printStackTrace();
+                return new TransferResult(
+                    sourceFile.getFileName().toString(),
+                    0, 0, 0, false
+                );
+            }
+        }, transferExecutor);
+    }
+    
+    private List<FilePart> splitFile(Path file, long fileSize) {
+        List<FilePart> parts = new ArrayList<>();
+        long offset = 0;
+        int partNumber = 0;
+        
+        while (offset < fileSize) {
+            long size = Math.min(PART_SIZE, fileSize - offset);
+            parts.add(new FilePart(partNumber++, offset, size));
+            offset += size;
+        }
+        
+        return parts;
+    }
+    
+    private CompletableFuture<PartTransferResult> transferPartWithRetry(
+            Path sourceFile, FilePart part) {
+        return CompletableFuture.supplyAsync(() -> {
+            for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+                try {
+                    return transferPart(sourceFile, part);
+                } catch (Exception e) {
+                    System.err.println("Attempt " + (attempt + 1) + " failed for part " + 
+                                     part.partNumber + ": " + e.getMessage());
+                    if (attempt == MAX_RETRIES - 1) {
+                        return new PartTransferResult(part.partNumber, 0, 0, false);
+                    }
+                    try {
+                        Thread.sleep(1000 * (attempt + 1)); // Exponential backoff
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+            return new PartTransferResult(part.partNumber, 0, 0, false);
+        }, transferExecutor);
+    }
+    
+    private PartTransferResult transferPart(Path sourceFile, FilePart part) 
+            throws IOException {
+        long startTime = System.currentTimeMillis();
+        
+        try (Socket socket = new Socket(destinationIP, port);
+             RandomAccessFile raf = new RandomAccessFile(sourceFile.toFile(), "r");
+             OutputStream out = socket.getOutputStream();
+             DataOutputStream dos = new DataOutputStream(out)) {
+            
+            // Send part metadata
+            dos.writeInt(part.partNumber);
+            dos.writeLong(part.offset);
+            dos.writeLong(part.size);
+            
+            // Calculate checksum while reading
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            
+            // Read and send the part
+            raf.seek(part.offset);
+            byte[] buffer = new byte[8192];
+            long remaining = part.size;
+            
+            while (remaining > 0) {
+                int toRead = (int) Math.min(buffer.length, remaining);
+                int read = raf.read(buffer, 0, toRead);
+                
+                if (read == -1) break;
+                
+                dos.write(buffer, 0, read);
+                md.update(buffer, 0, read);
+                remaining -= read;
+            }
+            
+            // Send checksum
+            byte[] checksum = md.digest();
+            dos.write(checksum);
+            dos.flush();
+            
+            // Wait for acknowledgment
+            DataInputStream dis = new DataInputStream(socket.getInputStream());
+            boolean ack = dis.readBoolean();
+            
+            long endTime = System.currentTimeMillis();
+            
+            if (ack) {
+                System.out.println("Part " + part.partNumber + " transferred successfully " +
+                                 "(" + formatSize(part.size) + " in " + 
+                                 (endTime - startTime) + "ms)");
+                return new PartTransferResult(part.partNumber, part.size, 
+                                            endTime - startTime, true);
+            } else {
+                throw new IOException("Transfer verification failed");
+            }
+            
+        } catch (NoSuchAlgorithmException e) {
+            throw new IOException("MD5 not available", e);
+        }
+    }
+    
+    private void sendMetadata(String fileName, long fileSize, int numParts) 
+            throws IOException {
+        try (Socket socket = new Socket(destinationIP, port);
+             DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
+            
+            dos.writeUTF("METADATA");
+            dos.writeUTF(fileName);
+            dos.writeLong(fileSize);
+            dos.writeInt(numParts);
+            dos.flush();
+        }
+    }
+    
+    private void sendCompletionSignal(String fileName) throws IOException {
+        try (Socket socket = new Socket(destinationIP, port);
+             DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
+            
+            dos.writeUTF("COMPLETE");
+            dos.writeUTF(fileName);
+            dos.flush();
+        }
+    }
+    
+    private String formatSize(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return String.format("%.2f KB", bytes / 1024.0);
+        if (bytes < 1024 * 1024 * 1024) return String.format("%.2f MB", bytes / (1024.0 * 1024));
+        return String.format("%.2f GB", bytes / (1024.0 * 1024 * 1024));
+    }
+    
+    public void shutdown() {
+        transferExecutor.shutdown();
+    }
+    
+    static class TransferResult {
+        String fileName;
+        long bytesTransferred;
+        long timeMillis;
+        double throughputGbps;
+        boolean success;
+        
+        public TransferResult(String fileName, long bytesTransferred, 
+                            long timeMillis, double throughputGbps, boolean success) {
+            this.fileName = fileName;
+            this.bytesTransferred = bytesTransferred;
+            this.timeMillis = timeMillis;
+            this.throughputGbps = throughputGbps;
+            this.success = success;
+        }
+        
+        @Override
+        public String toString() {
+            return String.format("File: %s, Size: %d bytes, Time: %d ms, " +
+                               "Throughput: %.2f Gbps, Success: %s",
+                               fileName, bytesTransferred, timeMillis, 
+                               throughputGbps, success);
+        }
+    }
+    
+    static class PartTransferResult {
+        int partNumber;
+        long bytesTransferred;
+        long timeMillis;
+        boolean success;
+        
+        public PartTransferResult(int partNumber, long bytesTransferred, 
+                                long timeMillis, boolean success) {
+            this.partNumber = partNumber;
+            this.bytesTransferred = bytesTransferred;
+            this.timeMillis = timeMillis;
+            this.success = success;
+        }
+    }
+}
+
+// Receiver side
+class FileReceiver {
+    private final int port;
+    private final Path destinationDir;
+    private final Map<String, FileAssembler> assemblers = new ConcurrentHashMap<>();
+    private final ExecutorService executor = Executors.newFixedThreadPool(10);
+    
+    public FileReceiver(int port, Path destinationDir) {
+        this.port = port;
+        this.destinationDir = destinationDir;
+    }
+    
+    public void start() {
+        executor.submit(() -> {
+            try (ServerSocket serverSocket = new ServerSocket(port)) {
+                System.out.println("Receiver listening on port " + port);
+                
+                while (!Thread.currentThread().isInterrupted()) {
+                    Socket clientSocket = serverSocket.accept();
+                    executor.submit(() -> handleClient(clientSocket));
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        });
+    }
+    
+    private void handleClient(Socket socket) {
+        try (DataInputStream dis = new DataInputStream(socket.getInputStream());
+             DataOutputStream dos = new DataOutputStream(socket.getOutputStream())) {
+            
+            String command = dis.readUTF();
+            
+            switch (command) {
+                case "METADATA":
+                    String fileName = dis.readUTF();
+                    long fileSize = dis.readLong();
+                    int numParts = dis.readInt();
+                    
+                    FileAssembler assembler = new FileAssembler(
+                        destinationDir.resolve(fileName), fileSize, numParts);
+                    assemblers.put(fileName, assembler);
+                    
+                    System.out.println("Receiving file: " + fileName + 
+                                     " (" + fileSize + " bytes, " + numParts + " parts)");
+                    break;
+                    
+                case "COMPLETE":
+                    String completedFile = dis.readUTF();
+                    FileAssembler completed = assemblers.get(completedFile);
+                    if (completed != null && completed.isComplete()) {
+                        System.out.println("File transfer complete: " + completedFile);
+                    }
+                    break;
+                    
+                default:
+                    // Receiving a part
+                    int partNumber = dis.readInt();
+                    long offset = dis.readLong();
+                    long size = dis.readLong();
+                    
+                    // Read data
+                    byte[] data = new byte[(int) size];
+                    dis.readFully(data);
+                    
+                    // Read checksum
+                    byte[] receivedChecksum = new byte[16];
+                    dis.readFully(receivedChecksum);
+                    
+                    // Verify checksum
+                    MessageDigest md = MessageDigest.getInstance("MD5");
+                    byte[] calculatedChecksum = md.digest(data);
+                    
+                    boolean valid = Arrays.equals(receivedChecksum, calculatedChecksum);
+                    dos.writeBoolean(valid);
+                    dos.flush();
+                    
+                    if (valid) {
+                        // Write to file (simplified - would need file name from context)
+                        System.out.println("Received part " + partNumber + " (" + size + " bytes)");
+                    }
+                    break;
+            }
+            
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+    
+    public void shutdown() {
+        executor.shutdown();
+    }
+    
+    static class FileAssembler {
+        Path outputFile;
+        long fileSize;
+        int numParts;
+        Set<Integer> receivedParts = ConcurrentHashMap.newKeySet();
+        
+        public FileAssembler(Path outputFile, long fileSize, int numParts) {
+            this.outputFile = outputFile;
+            this.fileSize = fileSize;
+            this.numParts = numParts;
+        }
+        
+        public void receivePart(int partNumber, byte[] data, long offset) throws IOException {
+            try (RandomAccessFile raf = new RandomAccessFile(outputFile.toFile(), "rw")) {
+                raf.seek(offset);
+                raf.write(data);
+                receivedParts.add(partNumber);
+            }
+        }
+        
+        public boolean isComplete() {
+            return receivedParts.size() == numParts;
+        }
+    }
+}
+```
+
+---
+
+## 11. Two Queues in Fixed Array
+
+```java
+import java.util.*;
+import java.util.concurrent.locks.*;
+
+/**
+ * Implement two queues using a single fixed-size array with efficient space utilization
+ * 
+ * Strategy: Use circular buffer with block-based allocation
+ * - Array is divided into blocks
+ * - Empty blocks are tracked in a linked list
+ * - Each queue maintains pointers to its blocks
+ */
+class TwoQueuesInArray<T> {
+    private static final int BLOCK_SIZE = 10;
+    
+    private final Object[] array;
+    private final int capacity;
+    private final int numBlocks;
+    
+    // Block management
+    private final List<Block> blocks;
+    private final Deque<Integer> freeBlocks; // Indices of free blocks
+    
+    // Queue 1 and Queue 2
+    private final QueueInfo queue1;
+    private final QueueInfo queue2;
+    
+    private final ReadWriteLock lock = new ReentrantReadWriteLock();
+    
+    public TwoQueuesInArray(int capacity) {
+        this.capacity = capacity;
+        this.array = new Object[capacity];
+        this.numBlocks = (capacity + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        
+        // Initialize blocks
+        this.blocks = new ArrayList<>(numBlocks);
+        this.freeBlocks = new LinkedList<>();
+        
+        for (int i = 0; i < numBlocks; i++) {
+            int startIdx = i * BLOCK_SIZE;
+            int endIdx = Math.min(startIdx + BLOCK_SIZE, capacity);
+            blocks.add(new Block(i, startIdx, endIdx));
+            freeBlocks.offer(i);
+        }
+        
+        this.queue1 = new QueueInfo(1);
+        this.queue2 = new QueueInfo(2);
+    }
+    
+    public void enqueue1(T item) {
+        enqueue(queue1, item);
+    }
+    
+    public void enqueue2(T item) {
+        enqueue(queue2, item);
+    }
+    
+    public T dequeue1() {
+        return dequeue(queue1);
+    }
+    
+    public T dequeue2() {
+        return dequeue(queue2);
+    }
+    
+    private void enqueue(QueueInfo queue, T item) {
+        lock.writeLock().lock();
+        try {
+            // Check if current block has space
+            if (queue.blocks.isEmpty() || !currentBlockHasSpace(queue)) {
+                // Allocate new block
+                if (freeBlocks.isEmpty()) {
+                    throw new IllegalStateException("Queue " + queue.id + " is full");
+                }
+                
+                int blockIdx = freeBlocks.poll();
+                queue.blocks.offer(blockIdx);
+            }
+            
+            // Add to current block
+            int blockIdx = queue.blocks.peekLast();
+            Block block = blocks.get(blockIdx);
+            
+            array[block.writePos] = item;
+            block.writePos++;
+            block.size++;
+            queue.size++;
+            
+            System.out.println("Enqueued to Q" + queue.id + " at index " + 
+                             (block.writePos - 1) + " (block " + blockIdx + ")");
+            
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+    
+    @SuppressWarnings("unchecked")
+    private T dequeue(QueueInfo queue) {
+        lock.writeLock().lock();
+        try {
+            if (queue.blocks.isEmpty()) {
+                throw new NoSuchElementException("Queue " + queue.id + " is empty");
+            }
+            
+            int blockIdx = queue.blocks.peek();
+            Block block = blocks.get(blockIdx);
+            
+            T item = (T) array[block.readPos];
+            array[block.readPos] = null; // Help GC
+            block.readPos++;
+            block.size--;
+            queue.size--;
+            
+            System.out.println("Dequeued from Q" + queue.id + " at index " + 
+                             (block.readPos - 1) + " (block " + blockIdx + ")");
+            
+            // If block is now empty, return it to free list
+            if (block.size == 0) {
+                queue.blocks.poll();
+                block.reset();
+                freeBlocks.offer(blockIdx);
+                System.out.println("Block " + blockIdx + " freed and returned to pool");
+            }
+            
+            return item;
+            
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+    
+    private boolean currentBlockHasSpace(QueueInfo queue) {
+        if (queue.blocks.isEmpty()) return false;
+        
+        int blockIdx = queue.blocks.peekLast();
+        Block block = blocks.get(blockIdx);
+        
+        return block.writePos < block.endIdx;
+    }
+    
+    public int size1() {
+        lock.readLock().lock();
+        try {
+            return queue1.size;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+    
+    public int size2() {
+        lock.readLock().lock();
+        try {
+            return queue2.size;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+    
+    public void printState() {
+        lock.readLock().lock();
+        try {
+            System.out.println("\n=== Array State ===");
+            System.out.println("Queue 1: size=" + queue1.size + ", blocks=" + queue1.blocks);
+            System.out.println("Queue 2: size=" + queue2.size + ", blocks=" + queue2.blocks);
+            System.out.println("Free blocks: " + freeBlocks);
+            
+            for (int i = 0; i < numBlocks; i++) {
+                Block block = blocks.get(i);
+                System.out.println("Block " + i + ": [" + block.startIdx + "-" + 
+                                 block.endIdx + ") read=" + block.readPos + 
+                                 " write=" + block.writePos + " size=" + block.size);
+            }
+            System.out.println();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+    
+    static class Block {
+        int id;
+        int startIdx;
+        int endIdx;
+        int readPos;
+        int writePos;
+        int size;
+        
+        public Block(int id, int startIdx, int endIdx) {
+            this.id = id;
+            this.startIdx = startIdx;
+            this.endIdx = endIdx;
+            reset();
+        }
+        
+        public void reset() {
+            this.readPos = startIdx;
+            this.writePos = startIdx;
+            this.size = 0;
+        }
+    }
+    
+    static class QueueInfo {
+        int id;
+        Deque<Integer> blocks; // Block indices used by this queue
+        int size;
+        
+        public QueueInfo(int id) {
+            this.id = id;
+            this.blocks = new LinkedList<>();
+            this.size = 0;
+        }
+    }
+}
+
+// Test
+class TwoQueuesTest {
+    public static void main(String[] args) {
+        TwoQueuesInArray<Integer> queues = new TwoQueuesInArray<>(30);
+        
+        // Enqueue to both queues
+        System.out.println("=== Enqueuing to Queue 1 ===");
+        for (int i = 0; i < 15; i++) {
+            queues.enqueue1(i);
+        }
+        
+        queues.printState();
+        
+        System.out.println("=== Enqueuing to Queue 2 ===");
+        for (int i = 100; i < 110; i++) {
+            queues.enqueue2(i);
+        }
+        
+        queues.printState();
+        
+        System.out.println("=== Dequeuing from Queue 1 ===");
+        for (int i = 0; i < 12; i++) {
+            System.out.println("Dequeued: " + queues.dequeue1());
+        }
+        
+        queues.printState();
+        
+        System.out.println("=== Enqueuing more to Queue 2 (reusing freed blocks) ===");
+        for (int i = 200; i < 205; i++) {
+            queues.enqueue2(i);
+        }
+        
+        queues.printState();
+        
+        System.out.println("=== Final sizes ===");
+        System.out.println("Queue 1 size: " + queues.size1());
+        System.out.println("Queue 2 size: " + queues.size2());
+    }
+}
+```
+
+---
+
+## 12. BookMyShow Ticket Booking System
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
+
+class Show {
+    String showId;
+    String movieName;
+    String theater;
+    LocalDateTime showTime;
+    int totalSeats;
+    
+    public Show(String showId, String movieName, String theater, 
+                LocalDateTime showTime, int totalSeats) {
+        this.showId = showId;
+        this.movieName = movieName;
+        this.theater = theater;
+        this.showTime = showTime;
+        this.totalSeats = totalSeats;
+    }
+}
+
+enum SeatStatus {
+    AVAILABLE, LOCKED, BOOKED
+}
+
+class Seat {
+    String seatNumber;
+    SeatStatus status;
+    String lockedBy;
+    long lockExpiry;
+    
+    public Seat(String seatNumber) {
+        this.seatNumber = seatNumber;
+        this.status = SeatStatus.AVAILABLE;
+    }
+}
+
+class Booking {
+    String bookingId;
+    String userId;
+    String showId;
+    List<String> seatNumbers;
+    double amount;
+    BookingStatus status;
+    long timestamp;
+    
+    public Booking(String bookingId, String userId, String showId, 
+                   List<String> seatNumbers, double amount) {
+        this.bookingId = bookingId;
+        this.userId = userId;
+        this.showId = showId;
+        this.seatNumbers = seatNumbers;
+        this.amount = amount;
+        this.status = BookingStatus.PENDING;
+        this.timestamp = System.currentTimeMillis();
+    }
+}
+
+enum BookingStatus {
+    PENDING, CONFIRMED, CANCELLED, EXPIRED
+}
+
+class BookMyShowSystem {
+    private static final long LOCK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+    private static final double SEAT_PRICE = 200.0;
+    
+    private final Map<String, Show> shows = new ConcurrentHashMap<>();
+    private final Map<String, Map<String, Seat>> showSeats = new ConcurrentHashMap<>();
+    private final Map<String, Booking> bookings = new ConcurrentHashMap<>();
+    private final Map<String, ReentrantLock> showLocks = new ConcurrentHashMap<>();
+    
+    private final ScheduledExecutorService lockCleanupExecutor = 
+        Executors.newSingleThreadScheduledExecutor();
+    
+    public BookMyShowSystem() {
+        // Start lock cleanup task
+        lockCleanupExecutor.scheduleAtFixedRate(
+            this::cleanupExpiredLocks, 1, 1, TimeUnit.MINUTES);
+    }
+    
+    /**
+     * Add a new show
+     */
+    public void addShow(Show show) {
+        shows.put(show.showId, show);
+        showLocks.put(show.showId, new ReentrantLock());
+        
+        // Initialize seats
+        Map<String, Seat> seats = new ConcurrentHashMap<>();
+        for (int i = 1; i <= show.totalSeats; i++) {
+            String seatNumber = String.format("%c%d", 
+                'A' + (i - 1) / 10, (i - 1) % 10 + 1);
+            seats.put(seatNumber, new Seat(seatNumber));
+        }
+        showSeats.put(show.showId, seats);
+        
+        System.out.println("Added show: " + show.movieName + " at " + 
+                         show.theater + " with " + show.totalSeats + " seats");
+    }
+    
+    /**
+     * Search available shows
+     */
+    public List<Show> searchShows(String movieName, String theater) {
+        return shows.values().stream()
+            .filter(show -> (movieName == null || show.movieName.contains(movieName)) &&
+                          (theater == null || show.theater.contains(theater)))
+            .collect(Collectors.toList());
+    }
+    
+    /**
+     * Get available seats for a show
+     */
+    public List<String> getAvailableSeats(String showId) {
+        Map<String, Seat> seats = showSeats.get(showId);
+        if (seats == null) return Collections.emptyList();
+        
+        long now = System.currentTimeMillis();
+        
+        return seats.values().stream()
+            .filter(seat -> seat.status == SeatStatus.AVAILABLE || 
+                          (seat.status == SeatStatus.LOCKED && seat.lockExpiry < now))
+            .map(seat -> seat.seatNumber)
+            .sorted()
+            .collect(Collectors.toList());
+    }
+    
+    /**
+     * Lock seats for booking (with timeout)
+     */
+    public boolean lockSeats(String showId, List<String> seatNumbers, String userId) {
+        ReentrantLock lock = showLocks.get(showId);
+        if (lock == null) return false;
+        
+        lock.lock();
+        try {
+            Map<String, Seat> seats = showSeats.get(showId);
+            if (seats == null) return false;
+            
+            long now = System.currentTimeMillis();
+            
+            // Check if all seats are available
+            for (String seatNumber : seatNumbers) {
+                Seat seat = seats.get(seatNumber);
+                if (seat == null) return false;
+                
+                if (seat.status == SeatStatus.BOOKED) {
+                    return false;
+                }
+                
+                if (seat.status == SeatStatus.LOCKED && seat.lockExpiry >= now) {
+                    return false; // Still locked by someone else
+                }
+            }
+            
+            // Lock all seats
+            long lockExpiry = now + LOCK_TIMEOUT_MS;
+            for (String seatNumber : seatNumbers) {
+                Seat seat = seats.get(seatNumber);
+                seat.status = SeatStatus.LOCKED;
+                seat.lockedBy = userId;
+                seat.lockExpiry = lockExpiry;
+            }
+            
+            System.out.println("Locked seats " + seatNumbers + " for user " + userId);
+            return true;
+            
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    /**
+     * Confirm booking and payment
+     */
+    public Booking confirmBooking(String showId, List<String> seatNumbers, 
+                                  String userId, String paymentId) {
+        ReentrantLock lock = showLocks.get(showId);
+        if (lock == null) throw new IllegalArgumentException("Show not found");
+        
+        lock.lock();
+        try {
+            Map<String, Seat> seats = showSeats.get(showId);
+            if (seats == null) throw new IllegalArgumentException("Show not found");
+            
+            // Verify all seats are locked by this user
+            for (String seatNumber : seatNumbers) {
+                Seat seat = seats.get(seatNumber);
+                if (seat == null || seat.status != SeatStatus.LOCKED || 
+                    !userId.equals(seat.lockedBy)) {
+                    throw new IllegalStateException("Seats not properly locked");
+                }
+            }
+            
+            // Process payment (simulated)
+            boolean paymentSuccess = processPayment(paymentId, 
+                seatNumbers.size() * SEAT_PRICE);
+            
+            if (!paymentSuccess) {
+                // Release locks
+                releaseSeats(showId, seatNumbers);
+                throw new IllegalStateException("Payment failed");
+            }
+            
+            // Confirm booking
+            for (String seatNumber : seatNumbers) {
+                Seat seat = seats.get(seatNumber);
+                seat.status = SeatStatus.BOOKED;
+                seat.lockedBy = null;
+                seat.lockExpiry = 0;
+            }
+            
+            String bookingId = UUID.randomUUID().toString();
+            Booking booking = new Booking(bookingId, userId, showId, 
+                seatNumbers, seatNumbers.size() * SEAT_PRICE);
+            booking.status = BookingStatus.CONFIRMED;
+            
+            bookings.put(bookingId, booking);
+            
+            System.out.println("Booking confirmed: " + bookingId + 
+                             " for seats " + seatNumbers);
+            
+            return booking;
+            
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    /**
+     * Cancel booking
+     */
+    public boolean cancelBooking(String bookingId, String userId) {
+        Booking booking = bookings.get(bookingId);
+        if (booking == null || !booking.userId.equals(userId)) {
+            return false;
+        }
+        
+        if (booking.status != BookingStatus.CONFIRMED) {
+            return false;
+        }
+        
+        ReentrantLock lock = showLocks.get(booking.showId);
+        lock.lock();
+        try {
+            // Release seats
+            Map<String, Seat> seats = showSeats.get(booking.showId);
+            for (String seatNumber : booking.seatNumbers) {
+                Seat seat = seats.get(seatNumber);
+                if (seat != null) {
+                    seat.status = SeatStatus.AVAILABLE;
+                }
+            }
+            
+            booking.status = BookingStatus.CANCELLED;
+            
+            // Process refund (simulated)
+            processRefund(userId, booking.amount);
+            
+            System.out.println("Booking cancelled: " + bookingId);
+            return true;
+            
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    private void releaseSeats(String showId, List<String> seatNumbers) {
+        Map<String, Seat> seats = showSeats.get(showId);
+        if (seats == null) return;
+        
+        for (String seatNumber : seatNumbers) {
+            Seat seat = seats.get(seatNumber);
+            if (seat != null && seat.status == SeatStatus.LOCKED) {
+                seat.status = SeatStatus.AVAILABLE;
+                seat.lockedBy = null;
+                seat.lockExpiry = 0;
+            }
+        }
+    }
+    
+    private void cleanupExpiredLocks() {
+        long now = System.currentTimeMillis();
+        
+        for (Map.Entry<String, Map<String, Seat>> entry : showSeats.entrySet()) {
+            String showId = entry.getKey();
+            Map<String, Seat> seats = entry.getValue();
+            
+            ReentrantLock lock = showLocks.get(showId);
+            if (lock.tryLock()) {
+                try {
+                    for (Seat seat : seats.values()) {
+                        if (seat.status == SeatStatus.LOCKED && seat.lockExpiry < now) {
+                            seat.status = SeatStatus.AVAILABLE;
+                            seat.lockedBy = null;
+                            seat.lockExpiry = 0;
+                            System.out.println("Released expired lock on seat " + 
+                                             seat.seatNumber + " in show " + showId);
+                        }
+                    }
+                } finally {
+                    lock.unlock();
+                }
+            }
+        }
+    }
+    
+    private boolean processPayment(String paymentId, double amount) {
+        // Simulate payment processing
+        try {
+            Thread.sleep(100);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+    
+    private void processRefund(String userId, double amount) {
+        // Simulate refund processing
+        System.out.println("Refunded " + amount + " to user " + userId);
+    }
+    
+    public void shutdown() {
+        lockCleanupExecutor.shutdown();
+    }
+}
+
+// Test
+class BookMyShowTest {
+    public static void main(String[] args) throws InterruptedException {
+        BookMyShowSystem system = new BookMyShowSystem();
+        
+        // Add shows
+        Show show1 = new Show("S1", "Avengers", "PVR Cinemas", 
+            LocalDateTime.now().plusHours(2), 50);
+        system.addShow(show1);
+        
+        // Simulate concurrent booking
+        ExecutorService executor = Executors.newFixedThreadPool(5);
+        
+        // User 1 tries to book
+        executor.submit(() -> {
+            String userId = "User1";
+            List<String> seats = Arrays.asList("A1", "A2", "A3");
+            
+            System.out.println("\n" + userId + " attempting to lock seats...");
+            if (system.lockSeats("S1", seats, userId)) {
+                try {
+                    Thread.sleep(2000); // Simulate user filling payment details
+                    Booking booking = system.confirmBooking("S1", seats, userId, "PAY1");
+                    System.out.println(userId + " booking confirmed: " + booking.bookingId);
+                } catch (Exception e) {
+                    System.out.println(userId + " booking failed: " + e.getMessage());
+                }
+            } else {
+                System.out.println(userId + " failed to lock seats");
+            }
+        });
+        
+        Thread.sleep(500);
+        
+        // User 2 tries to book same seats (should fail)
+        executor.submit(() -> {
+            String userId = "User2";
+            List<String> seats = Arrays.asList("A2", "A3", "A4");
+            
+            System.out.println("\n" + userId + " attempting to lock seats...");
+            if (system.lockSeats("S1", seats, userId)) {
+                try {
+                    Booking booking = system.confirmBooking("S1", seats, userId, "PAY2");
+                    System.out.println(userId + " booking confirmed: " + booking.bookingId);
+                } catch (Exception e) {
+                    System.out.println(userId + " booking failed: " + e.getMessage());
+                }
+            } else {
+                System.out.println(userId + " failed to lock seats (expected)");
+            }
+        });
+        
+        Thread.sleep(1000);
+        
+        // User 3 books different seats (should succeed)
+        executor.submit(() -> {
+            String userId = "User3";
+            List<String> seats = Arrays.asList("B1", "B2");
+            
+            System.out.println("\n" + userId + " attempting to lock seats...");
+            if (system.lockSeats("S1", seats, userId)) {
+                try {
+                    Booking booking = system.confirmBooking("S1", seats, userId, "PAY3");
+                    System.out.println(userId + " booking confirmed: " + booking.bookingId);
+                } catch (Exception e) {
+                    System.out.println(userId + " booking failed: " + e.getMessage());
+                }
+            } else {
+                System.out.println(userId + " failed to lock seats");
+            }
+        });
+        
+        Thread.sleep(5000);
+        
+        System.out.println("\n=== Available seats ===");
+        System.out.println(system.getAvailableSeats("S1"));
+        
+        executor.shutdown();
+        executor.awaitTermination(1, TimeUnit.MINUTES);
+        system.shutdown();
+    }
+}
+```
+
+---
+
+## 13. Byte-based IO over Block-based Interface
+
+```java
+import java.util.*;
+import java.util.concurrent.locks.*;
+
+/**
+ * Implement byte-based IO over block-based interface
+ * Block size is fixed (e.g., 4096 bytes)
+ */
+class ByteBasedIO {
+    private final int blockSize;
+    private int currentPosition = 0;
+    private final Map<Integer, byte[]> blockCache = new HashMap<>();
+    private final Lock lock = new ReentrantLock();
+    
+    // Simulated block-based interface
+    private final BlockBasedInterface blockInterface;
+    
+    public ByteBasedIO(int blockSize) {
+        this.blockSize = blockSize;
+        this.blockInterface = new BlockBasedInterface(blockSize);
+    }
+    
+    /**
+     * Seek to a specific byte position
+     */
+    public void seek(int position) {
+        lock.lock();
+        try {
+            if (position < 0) {
+                throw new IllegalArgumentException("Position must be non-negative");
+            }
+            currentPosition = position;
+            System.out.println("Seeked to position " + position);
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    /**
+     * Write bytes starting from current position
+     */
+    public int write(byte[] data, int len) {
+        lock.lock();
+        try {
+            if (len <= 0 || data == null) return 0;
+            
+            int bytesWritten = 0;
+            int offset = 0;
+            
+            while (bytesWritten < len) {
+                int blockNum = currentPosition / blockSize;
+                int offsetInBlock = currentPosition % blockSize;
+                int remainingInBlock = blockSize - offsetInBlock;
+                int toWrite = Math.min(len - bytesWritten, remainingInBlock);
+                
+                // Read existing block (if exists)
+                byte[] block = getOrCreateBlock(blockNum);
+                
+                // Modify block
+                System.arraycopy(data, offset, block, offsetInBlock, toWrite);
+                
+                // Write block back
+                blockInterface.bSeek(blockNum);
+                blockInterface.bWrite(block);
+                
+                // Update cache
+                blockCache.put(blockNum, block);
+                
+                bytesWritten += toWrite;
+                offset += toWrite;
+                currentPosition += toWrite;
+            }
+            
+            System.out.println("Wrote " + bytesWritten + " bytes");
+            return bytesWritten;
+            
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    /**
+     * Read bytes starting from current position
+     */
+    public int read(byte[] buffer, int len) {
+        lock.lock();
+        try {
+            if (len <= 0 || buffer == null) return 0;
+            
+            int bytesRead = 0;
+            int offset = 0;
+            
+            while (bytesRead < len) {
+                int blockNum = currentPosition / blockSize;
+                int offsetInBlock = currentPosition % blockSize;
+                int remainingInBlock = blockSize - offsetInBlock;
+                int toRead = Math.min(len - bytesRead, remainingInBlock);
+                
+                // Read block
+                byte[] block = getOrCreateBlock(blockNum);
+                
+                // Check if we've reached end of data
+                if (block == null) {
+                    break;
+                }
+                
+                // Copy to buffer
+                System.arraycopy(block, offsetInBlock, buffer, offset, toRead);
+                
+                bytesRead += toRead;
+                offset += toRead;
+                currentPosition += toRead;
+            }
+            
+            System.out.println("Read " + bytesRead + " bytes");
+            return bytesRead;
+            
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    private byte[] getOrCreateBlock(int blockNum) {
+        // Check cache first
+        if (blockCache.containsKey(blockNum)) {
+            return blockCache.get(blockNum);
+        }
+        
+        // Read from block interface
+        blockInterface.bSeek(blockNum);
+        byte[] block = blockInterface.bRead();
+        
+        if (block == null) {
+            // Create new empty block
+            block = new byte[blockSize];
+        }
+        
+        blockCache.put(blockNum, block);
+        return block;
+    }
+    
+    public int getCurrentPosition() {
+        lock.lock();
+        try {
+            return currentPosition;
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    public void flush() {
+        lock.lock();
+        try {
+            // Write all cached blocks
+            for (Map.Entry<Integer, byte[]> entry : blockCache.entrySet()) {
+                blockInterface.bSeek(entry.getKey());
+                blockInterface.bWrite(entry.getValue());
+            }
+            System.out.println("Flushed " + blockCache.size() + " blocks");
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+
+/**
+ * Simulated block-based interface (provided by system)
+ */
+class BlockBasedInterface {
+    private final int blockSize;
+    private final Map<Integer, byte[]> storage = new HashMap<>();
+    private int currentBlock = 0;
+    
+    public BlockBasedInterface(int blockSize) {
+        this.blockSize = blockSize;
+    }
+    
+    public void bSeek(int blockNum) {
+        currentBlock = blockNum;
+    }
+    
+    public void bWrite(byte[] blockData) {
+        if (blockData.length != blockSize) {
+            throw new IllegalArgumentException("Block size mismatch");
+        }
+        storage.put(currentBlock, Arrays.copyOf(blockData, blockSize));
+        System.out.println("  [BlockInterface] Wrote block " + currentBlock);
+    }
+    
+    public byte[] bRead() {
+        byte[] block = storage.get(currentBlock);
+        System.out.println("  [BlockInterface] Read block " + currentBlock + 
+                         (block != null ? " (exists)" : " (null)"));
+        return block != null ? Arrays.copyOf(block, blockSize) : null;
+    }
+    
+    public int bBlockSize() {
+        return blockSize;
+    }
+}
+
+// Test
+class ByteBasedIOTest {
+    public static void main(String[] args) {
+        ByteBasedIO io = new ByteBasedIO(16); // Small block size for testing
+        
+        System.out.println("=== Test Case from Problem ===\n");
+        
+        // seek(12)
+        io.seek(12);
+        
+        // write(data1, 15) - writes 15 bytes starting at position 12
+        byte[] data1 = "AAAAAAAAAAAAAAA".getBytes(); // 15 A's
+        io.write(data1, 15);
+        System.out.println("After write 1, position: " + io.getCurrentPosition()); // Should be 27
+        
+        // write(data2, 16) - writes 16 bytes starting at position 27
+        byte[] data2 = "BBBBBBBBBBBBBBBB".getBytes(); // 16 B's
+        io.write(data2, 16);
+        System.out.println("After write 2, position: " + io.getCurrentPosition()); // Should be 43
+        
+        // seek(17)
+        io.seek(17);
+        
+        // read(data3, 2) - reads 2 bytes from position 17
+        byte[] data3 = new byte[2];
+        int read = io.read(data3, 2);
+        System.out.println("Read " + read + " bytes: " + new String(data3));
+        System.out.println("After read, position: " + io.getCurrentPosition()); // Should be 19
+        
+        System.out.println("\n=== Additional Tests ===\n");
+        
+        // Test: Write across block boundary
+        io.seek(0);
+        byte[] largeData = new byte[50];
+        Arrays.fill(largeData, (byte) 'X');
+        io.write(largeData, 50);
+        
+        // Test: Read back
+        io.seek(0);
+        byte[] readBuffer = new byte[50];
+        io.read(readBuffer, 50);
+        System.out.println("Read back: " + new String(readBuffer));
+        
+        // Test: Flush
+        io.flush();
+    }
+}
+```
+
+---
+
+These solutions demonstrate:
+
+✅ **Advanced concurrency patterns** (locks, atomics, futures)  
+✅ **Resource management** (pools, caches, cleanup)  
+✅ **Scalability** (parallel processing, non-blocking APIs)  
+✅ **Error handling** (retries, timeouts, recovery)  
+✅ **Production-ready code** (logging, monitoring, graceful shutdown)
